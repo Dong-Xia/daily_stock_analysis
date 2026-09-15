@@ -28,6 +28,12 @@ from data_provider import DataFetcherManager
 from data_provider.base import normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import GeminiAnalyzer, AnalysisResult, fill_chip_structure_if_needed, fill_price_position_if_needed
+from src.services.market_money_status import assess_market_money_status, format_money_status_block
+from src.services.trading_annotations import (
+    compute_cycle_structure,
+    compute_heat_label,
+    compute_trend_confirmation,
+)
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.notification import NotificationService, NotificationChannel
 from src.report_language import (
@@ -491,6 +497,22 @@ class StockAnalysisPipeline:
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
 
+            # Step 7.8: 交易原则注解（P4/P1/P2，fail-open）
+            if result:
+                try:
+                    trend_dict = enhanced_context.get('trend_analysis')
+                    if trend_dict:
+                        ann = {}
+                        ann['cycle_structure'] = compute_cycle_structure(trend_dict)
+                        ann['trend_confirmation'] = compute_trend_confirmation(trend_dict)
+                        realtime_dict = enhanced_context.get('realtime', {})
+                        ann['heat_label'] = compute_heat_label(realtime_dict, trend_dict)
+                        if result.market_snapshot is None:
+                            result.market_snapshot = {}
+                        result.market_snapshot['trading_annotations'] = ann
+                except Exception as e:
+                    logger.debug("交易原则注解注入失败（fail-open）: %s", e)
+
             # Step 8: 保存分析历史记录
             if result and result.success:
                 try:
@@ -509,6 +531,41 @@ class StockAnalysisPipeline:
                         context_snapshot=context_snapshot,
                         save_snapshot=self.save_context_snapshot
                     )
+
+                    # Auto-record Xinfa entry on buy/sell signals
+                    if result.decision_type in ("buy", "sell"):
+                        try:
+                            from src.services.xinfa_service import XinfaService
+                            from src.schemas.xinfa import XinfaEntryCreate
+                            action_label = "买入信号" if result.decision_type == "buy" else "卖出信号"
+                            xinfa_svc = XinfaService()
+                            xinfa_svc.create_entry(XinfaEntryCreate(
+                                title=f"{result.name}({result.code}) {action_label}",
+                                content=(
+                                    f"## {result.name} ({result.code}) - {action_label}\n\n"
+                                    f"**综合评分**: {result.sentiment_score}\n"
+                                    f"**操作建议**: {result.operation_advice}\n"
+                                    f"**趋势预测**: {result.trend_prediction}\n"
+                                    f"**核心结论**: {result.get_core_conclusion()}\n\n"
+                                    f"**买点质量评分**: {result.buy_quality_score or 'N/A'}\n"
+                                    f"**周期共振**: {result.cycle_resonance or 'N/A'} ({result.cycle_resonance_level or 'N/A'})\n"
+                                    f"**周线趋势**: {result.weekly_trend or 'N/A'}\n"
+                                    f"**日线结构**: {result.daily_structure or 'N/A'}\n"
+                                    f"**小时线信号**: {result.hourly_signal or 'N/A'}\n\n"
+                                    f"**统计数据**:\n"
+                                    f"- 理想买入点: {result.get_sniper_points().get('ideal_buy', 'N/A')}\n"
+                                    f"- 止损位: {result.get_sniper_points().get('stop_loss', 'N/A')}\n"
+                                    f"- 止盈位: {result.get_sniper_points().get('take_profit', 'N/A')}\n\n"
+                                    f"**分析摘要**: {result.analysis_summary}"
+                                ),
+                                category="plan",
+                                tags=["auto-record", result.decision_type],
+                                stock_code=result.code,
+                                stock_name=result.name,
+                            ))
+                            logger.info(f"心法自动记录: {result.name}({result.code}) {action_label}")
+                        except Exception as e:
+                            logger.warning(f"心法自动记录失败（非阻断）: {e}")
                 except Exception as e:
                     logger.warning(f"{stock_name}({code}) 保存分析历史失败: {e}")
 
@@ -589,7 +646,7 @@ class StockAnalysisPipeline:
         
         # 添加趋势分析结果
         if trend_result:
-            enhanced['trend_analysis'] = {
+            trend_dict = {
                 'trend_status': trend_result.trend_status.value,
                 'ma_alignment': trend_result.ma_alignment,
                 'trend_strength': trend_result.trend_strength,
@@ -601,7 +658,36 @@ class StockAnalysisPipeline:
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
+                'macd_status': trend_result.macd_status.value,
             }
+            enhanced['trend_analysis'] = trend_dict
+
+            # P4/P1/P2: 交易原则注解（fail-open）
+            try:
+                enhanced['trading_annotations'] = {
+                    'cycle_structure': compute_cycle_structure(trend_dict),
+                    'trend_confirmation': compute_trend_confirmation(trend_dict),
+                }
+            except Exception as e:
+                logger.debug("交易原则注解计算失败（fail-open）: %s", e)
+
+        # P1: 热门/冷门标签（需要 realtime 数据）
+        if realtime_quote:
+            try:
+                realtime_dict = enhanced.get('realtime', {})
+                sector_names = None
+                if fundamental_context and isinstance(fundamental_context, dict):
+                    boards = fundamental_context.get('belong_boards') or []
+                    sector_names = [b.get('name', '') for b in boards if isinstance(b, dict)]
+                heat_label = compute_heat_label(
+                    realtime_dict,
+                    enhanced.get('trend_analysis'),
+                    sector_names=sector_names,
+                )
+                ann = enhanced.setdefault('trading_annotations', {})
+                ann['heat_label'] = heat_label
+            except Exception as e:
+                logger.debug("热门/冷门标签计算失败（fail-open）: %s", e)
 
         # Issue #234: Override today with realtime OHLC + trend MA for intraday analysis
         # Guard: trend_result.ma5 > 0 ensures MA calculation succeeded (data sufficient)
@@ -856,6 +942,33 @@ class StockAnalysisPipeline:
                         context_snapshot=initial_context,
                         save_snapshot=self.save_context_snapshot
                     )
+
+                    # Auto-record Xinfa entry on buy/sell signals (agent path)
+                    if result.decision_type in ("buy", "sell"):
+                        try:
+                            from src.services.xinfa_service import XinfaService
+                            from src.schemas.xinfa import XinfaEntryCreate
+                            action_label = "买入信号" if result.decision_type == "buy" else "卖出信号"
+                            xinfa_svc = XinfaService()
+                            xinfa_svc.create_entry(XinfaEntryCreate(
+                                title=f"{resolved_stock_name}({code}) {action_label}",
+                                content=(
+                                    f"## {resolved_stock_name} ({code}) - {action_label}\n\n"
+                                    f"**综合评分**: {result.sentiment_score}\n"
+                                    f"**操作建议**: {result.operation_advice}\n"
+                                    f"**核心结论**: {result.get_core_conclusion()}\n"
+                                    f"**周期共振**: {result.cycle_resonance or 'N/A'} ({result.cycle_resonance_level or 'N/A'})\n"
+                                    f"**买点质量**: {result.buy_quality_score or 'N/A'}\n\n"
+                                    f"**分析摘要**: {result.analysis_summary}"
+                                ),
+                                category="plan",
+                                tags=["auto-record", result.decision_type, "agent"],
+                                stock_code=code,
+                                stock_name=resolved_stock_name,
+                            ))
+                            logger.info(f"心法自动记录: {resolved_stock_name}({code}) {action_label}")
+                        except Exception as e:
+                            logger.warning(f"心法自动记录失败（非阻断）: {e}")
                 except Exception as e:
                     logger.warning(f"[{code}] 保存 Agent 分析历史失败: {e}")
 
@@ -1682,7 +1795,31 @@ class StockAnalysisPipeline:
         """Generate aggregate report with backward-compatible notifier fallback."""
         generator = getattr(self.notifier, "generate_aggregate_report", None)
         if callable(generator):
-            return generator(results, report_type)
-        if report_type == ReportType.BRIEF and hasattr(self.notifier, "generate_brief_report"):
-            return self.notifier.generate_brief_report(results)
-        return self.notifier.generate_dashboard_report(results)
+            report = generator(results, report_type)
+        elif report_type == ReportType.BRIEF and hasattr(self.notifier, "generate_brief_report"):
+            report = self.notifier.generate_brief_report(results)
+        else:
+            report = self.notifier.generate_dashboard_report(results)
+
+        # P5: 追加市场资金水位块（仅完整报告模式）
+        if report and report_type in (ReportType.SIMPLE, ReportType.FULL):
+            try:
+                money_status = assess_market_money_status(self.fetcher_manager)
+                money_block = format_money_status_block(
+                    money_status,
+                    language=getattr(self.config, "report_language", "zh"),
+                )
+                if money_block:
+                    # 在标题行后插入资金状态块
+                    first_newline = report.find("\n")
+                    if first_newline > 0:
+                        report = (
+                            report[:first_newline]
+                            + "\n\n"
+                            + money_block
+                            + report[first_newline:]
+                        )
+            except Exception as e:
+                logger.debug("市场资金水位块生成失败（fail-open）: %s", e)
+
+        return report

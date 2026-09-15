@@ -15,8 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-
-_BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "strategies"
+from src.agent.skills.base import _BUILTIN_SKILLS_DIR
 
 SKILL_AGENT_PREFIX = "skill_"
 LEGACY_STRATEGY_AGENT_PREFIX = "strategy_"

@@ -921,7 +921,57 @@ class NotificationService(
                     ])
 
                 self._append_market_snapshot(report_lines, result)
-                
+
+                # ========== 交易原则注解（P4/P1/P2）==========
+                market_snapshot = result.market_snapshot or {}
+                annotations = market_snapshot.get('trading_annotations', {}) or {}
+                if annotations:
+                    ann_lines = []
+                    # P2: 趋势确认
+                    tc = annotations.get('trend_confirmation', {}) or {}
+                    if tc.get('status'):
+                        bias_warn = tc.get('bias_warning', '')
+                        bias_text = f"（{bias_warn}）" if bias_warn else ""
+                        ann_lines.append(
+                            f"**{labels.get('ann_trend_status_label', '趋势确认')}**: {tc['status']}{bias_text}"
+                        )
+                    # P4: 三周期结构
+                    cs = annotations.get('cycle_structure', {}) or {}
+                    if cs.get('alignment'):
+                        alignment_emoji = {
+                            "all_bullish": "🟢",
+                            "all_bearish": "🔴",
+                            "long_med_bullish_short_diverge": "🟡",
+                            "long_bullish_med_diverge": "🟠",
+                            "bearish_with_short_rebound": "🟡",
+                            "mixed": "⚪",
+                        }
+                        emoji = alignment_emoji.get(cs['alignment'], "⚪")
+                        ann_lines.append(
+                            f"**{labels.get('ann_cycle_label', '三周期结构')}**: "
+                            f"长线{cs.get('long_term', '?')}｜中线{cs.get('medium_term', '?')}｜短线{cs.get('short_term', '?')} "
+                            f"{emoji}"
+                        )
+                    # P1: 热门/冷门
+                    hl = annotations.get('heat_label', {}) or {}
+                    if hl.get('label'):
+                        heat_emoji = {
+                            "热门": "🔥", "活跃": "⚡", "中性": "➖", "冷门": "❄️",
+                            "Hot": "🔥", "Active": "⚡", "Neutral": "➖", "Cold": "❄️",
+                        }
+                        hemoji = heat_emoji.get(hl['label'], "➖")
+                        ann_lines.append(
+                            f"**{labels.get('ann_heat_label', '热度')}**: {hemoji} {hl['label']}　"
+                            f"{hl.get('turnover_desc', '')}　{hl.get('momentum_desc', '')}"
+                        )
+                    if ann_lines:
+                        report_lines.extend([
+                            f"### 📋 {labels.get('ann_heading', '交易原则')}",
+                            "",
+                        ])
+                        report_lines.extend(ann_lines)
+                        report_lines.append("")
+
                 # ========== 数据透视 ==========
                 data_persp = dashboard.get('data_perspective', {}) if dashboard else {}
                 if data_persp:

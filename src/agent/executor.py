@@ -318,6 +318,7 @@ LEGACY_DEFAULT_CHAT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mark
 当用户询问某支股票时，必须按以下四个阶段顺序调用工具，每阶段等工具结果全部返回后再进入下一阶段：
 
 **第一阶段 · 行情与K线**（必须先执行）
+- 如果激活技能需要全市场数据（如大盘择时），先调用 `get_market_overview` 获取全市场涨跌家数统计
 - 调用 `get_realtime_quote` 获取实时行情和当前价格
 - 调用 `get_daily_history` 获取近期历史K线数据
 
@@ -355,6 +356,7 @@ CHAT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数�
 当用户询问某支股票时，必须按以下四个阶段顺序调用工具，每阶段等工具结果全部返回后再进入下一阶段：
 
 **第一阶段 · 行情与K线**（必须先执行）
+- 如果激活技能需要全市场数据（如大盘择时），先调用 `get_market_overview` 获取全市场涨跌家数统计
 - 调用 `get_realtime_quote` 获取实时行情和当前价格
 - 调用 `get_daily_history` 获取近期历史K线数据
 

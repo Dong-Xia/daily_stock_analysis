@@ -624,6 +624,50 @@ class LLMUsage(Base):
     called_at = Column(DateTime, default=datetime.now, index=True)
 
 
+class XinfaEntry(Base):
+    """
+    心法条目 — 记录炒股心得、交易反思、经验总结。
+
+    心法模块用于记录用户在炒股过程中的心得体会，包括但不限于：
+    - 复盘反思：对某笔交易的事后总结
+    - 交易纪律：自省和强化的交易规则
+    - 心态建设：情绪管理和心理建设记录
+    - 经验总结：某类模式或技巧的归纳
+    - 交易计划：前瞻性的交易策略笔记
+    """
+    __tablename__ = 'xinfa_entries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(200), nullable=False, doc="标题")
+    content = Column(Text, nullable=False, doc="正文（Markdown 格式）")
+    category = Column(
+        String(32), nullable=False, default='general', index=True,
+        doc="分类：general / review / discipline / mindset / experience / plan",
+    )
+    tags = Column(Text, doc="JSON 字符串，如 [\"趋势\",\"止损\"]")
+    stock_code = Column(String(10), index=True, doc="关联股票代码")
+    stock_name = Column(String(50), doc="关联股票名称")
+    sentiment = Column(Integer, doc="情绪/评分 1-5")
+    is_starred = Column(Boolean, default=False, doc="是否标星")
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'title': self.title,
+            'content': self.content,
+            'category': self.category,
+            'tags': self.tags,
+            'stock_code': self.stock_code,
+            'stock_name': self.stock_name,
+            'sentiment': self.sentiment,
+            'is_starred': self.is_starred,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class DatabaseManager:
     """
     数据库管理器 - 单例模式

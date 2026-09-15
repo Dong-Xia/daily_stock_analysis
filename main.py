@@ -357,6 +357,90 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
+    parser.add_argument(
+        '--screen',
+        type=str,
+        default=None,
+        metavar='SECTOR',
+        help='板块选股: --screen 半导体  (快速4层漏斗筛选)',
+    )
+
+    parser.add_argument(
+        '--sector-rotation',
+        action='store_true',
+        help='板块轮动分析: 多日排行持续性/动量/分类',
+    )
+
+    parser.add_argument(
+        '--position-size',
+        type=str,
+        default=None,
+        metavar='CODE:ENTRY:STOP:EQUITY',
+        help='仓位计算: --position-size 600519:1800:1764:1000000',
+    )
+
+    parser.add_argument(
+        '--stop-loss',
+        type=str,
+        default=None,
+        metavar='CODE:ENTRY:STOP:METHOD',
+        help='止损评估: --stop-loss 600519:100:95:atr',
+    )
+
+    parser.add_argument(
+        '--rebalance',
+        type=str,
+        default=None,
+        metavar='C1:P1:S1,C2:P2:S2,...',
+        help='调仓分析: --rebalance 600519:1800:白酒,000858:145:白酒',
+    )
+
+    parser.add_argument(
+        '--fundamental',
+        type=str,
+        default=None,
+        nargs='?',
+        const='auto',
+        metavar='YYYYMMDD',
+        help='基本面选股: --fundamental (默认最新季度) 或 --fundamental 20260331',
+    )
+
+    # === 心法模块 ===
+    parser.add_argument(
+        '--xinfa',
+        type=str,
+        default=None,
+        nargs='?',
+        const='list',
+        metavar='ACTION',
+        help='心法模块: --xinfa (列出最近20条), --xinfa create <标题> <内容>, --xinfa get <ID>, --xinfa delete <ID>, --xinfa search <关键词>',
+    )
+    parser.add_argument(
+        '--xinfa-title',
+        type=str,
+        default=None,
+        help='配合 --xinfa create 使用，指定标题',
+    )
+    parser.add_argument(
+        '--xinfa-content',
+        type=str,
+        default=None,
+        help='配合 --xinfa create 使用，指定内容',
+    )
+    parser.add_argument(
+        '--xinfa-category',
+        type=str,
+        default='general',
+        help='配合 --xinfa create 使用，分类: general/review/discipline/mindset/experience/plan',
+    )
+
+    # === 复盘模板 ===
+    parser.add_argument(
+        '--review-template',
+        action='store_true',
+        help='打印涅盘重升式每日复盘模板',
+    )
+
     return parser.parse_args()
 
 
@@ -819,7 +903,206 @@ def main() -> int:
             )
             return 0
 
-        # 模式1: 仅大盘复盘
+        # 模式1: 基本面选股
+        if args.fundamental:
+            from src.services.fundamental_screener import FundamentalScreener
+            q = None if args.fundamental == "auto" else args.fundamental
+            s = FundamentalScreener(max_candidates=get_config().fundamental_max_candidates)
+            r = s.screen(q)
+            print(FundamentalScreener.format_result(r))
+            return 0
+
+        # 模式2: 调仓分析
+        if args.rebalance:
+            positions = []
+            for pair in args.rebalance.split(","):
+                parts = pair.split(":")
+                if len(parts) >= 2:
+                    positions.append({
+                        "code": parts[0], "name": parts[0],
+                        "current_price": float(parts[1]), "cost_price": float(parts[1]),
+                        "sector": parts[2] if len(parts) > 2 else "",
+                        "return_pct": 0,
+                    })
+            if positions:
+                from src.services.rebalance_engine import RebalanceEngine
+                engine = RebalanceEngine()
+                result = engine.analyze(positions)
+                print(RebalanceEngine.format_result(result))
+            return 0
+
+        # 模式2: 止损评估
+        if args.stop_loss:
+            from src.services.stop_loss_manager import StopLossManager, StopConfig, StopMethod
+            parts = args.stop_loss.split(":")
+            code, entry, price = parts[0], float(parts[1]), float(parts[2])
+            method = StopMethod.ATR
+            if len(parts) > 3:
+                try:
+                    method = StopMethod(parts[3].lower())
+                except ValueError:
+                    pass
+            mgr = StopLossManager()
+            stops = mgr.compute_initial_stops(entry, None, method)
+            config = StopConfig(stock_code=code, entry_price=entry, stop_price=stops.hard_stop, stop_method=method)
+            events = mgr.evaluate(config, price)
+            print(f"\n{stops.rationale}")
+            print(StopLossManager.format_events(events))
+            return 0
+
+        # 模式2: 仓位计算
+        if args.position_size:
+            parts = args.position_size.split(":")
+            if len(parts) < 4:
+                logger.error("格式错误，应使用: CODE:ENTRY:STOP:EQUITY (如 600519:1800:1764:1000000)")
+                return 1
+            code, entry, stop, equity = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+            from src.services.position_sizer import PositionSizer, SizeRequest
+            sizer = PositionSizer()
+            req = SizeRequest(stock_code=code, entry_price=entry, stop_loss_price=stop, account_equity=equity, max_positions=5)
+            result = sizer.calculate(req)
+            print(PositionSizer.format_terminal(result))
+            return 0
+
+        # 模式: 打印复盘模板
+        if args.review_template:
+            template_path = os.path.join(os.path.dirname(__file__), "docs", "review-template.md")
+            try:
+                with open(template_path, "r", encoding="utf-8") as f:
+                    print(f.read())
+            except FileNotFoundError:
+                logger.error("未找到复盘模板文件: %s", template_path)
+                return 1
+            return 0
+
+        # 模式: 心法模块
+        if args.xinfa:
+            from src.services.xinfa_service import XinfaService
+            from src.schemas.xinfa import XinfaEntryCreate
+            svc = XinfaService()
+            action = args.xinfa
+
+            if action == "create":
+                title = args.xinfa_title or input("标题: ").strip()
+                content = args.xinfa_content or input("内容: ").strip()
+                category = args.xinfa_category or "general"
+                if not title or not content:
+                    logger.error("标题和内容不能为空")
+                    return 1
+                data = XinfaEntryCreate(title=title, content=content, category=category)
+                entry = svc.create_entry(data)
+                if entry:
+                    print(XinfaService.format_terminal(entry))
+                else:
+                    logger.error("创建失败")
+                return 0
+
+            if action in ("get", "detail"):
+                import sys
+                entry_id = int(sys.argv[sys.argv.index("--xinfa") + 2]) if len(sys.argv) > 2 else None
+                if entry_id is None:
+                    entry_id = int(input("条目ID: ").strip())
+                entry = svc.get_entry(entry_id)
+                if entry:
+                    print(XinfaService.format_terminal(entry))
+                else:
+                    logger.error("条目不存在")
+                return 0
+
+            if action == "delete":
+                import sys
+                try:
+                    idx = sys.argv.index("--xinfa")
+                    entry_id = int(sys.argv[idx + 2])
+                except (ValueError, IndexError):
+                    entry_id = int(input("条目ID: ").strip())
+                ok = svc.delete_entry(entry_id)
+                if ok:
+                    logger.info("已删除心法条目 %d", entry_id)
+                else:
+                    logger.error("条目 %d 不存在", entry_id)
+                return 0
+
+            if action in ("search", "s"):
+                import sys
+                try:
+                    idx = sys.argv.index("--xinfa")
+                    keyword = sys.argv[idx + 2]
+                except (ValueError, IndexError):
+                    keyword = input("关键词: ").strip()
+                result = svc.list_entries(keyword=keyword)
+                print(XinfaService.format_terminal_list(result["items"], result["total"]))
+                return 0
+
+            # default: list
+            category_filter = args.xinfa_category if args.xinfa_category != "general" else None
+            result = svc.list_entries(category=category_filter, page_size=20)
+            print(XinfaService.format_terminal_list(result["items"], result["total"]))
+            return 0
+
+        # 模式2: 板块轮动分析
+        if args.sector_rotation:
+            logger.info("模式: 板块轮动分析")
+            from src.services.sector_rotation_tracker import SectorRotationTracker
+
+            tracker = SectorRotationTracker()
+            result = tracker.analyze()
+
+            print(f"\n{'='*70}")
+            print(f"  板块轮动分析 ({result.analysis_date}, 回看 {result.lookback_days} 天, {result.total_ranking_days} 个交易日)")
+            print(f"{'='*70}")
+
+            if result.top_main_lines:
+                print(f"\n  🔥 主线板块 (持续性强):")
+                for s in result.top_main_lines:
+                    print(f"    {s.name}: 连续{s.consecutive_days}天 | Top3 x{s.top3_count} | 趋势:{s.score_trend:+.1f} | 当前评分:{s.current_score:.1f}")
+
+            if result.rising_sectors:
+                print(f"\n  🚀 异动板块 (近期出现/趋势向上):")
+                for s in result.rising_sectors:
+                    print(f"    {s.name}: 出现{s.appearance_count}天 | 趋势:{s.score_trend:+.1f} | 评分:{s.current_score:.1f}")
+
+            if result.fading_sectors:
+                print(f"\n  📉 退潮板块 (趋势走弱):")
+                for s in result.fading_sectors:
+                    print(f"    {s.name}: 趋势:{s.score_trend:+.1f} | 评分:{s.current_score:.1f}")
+
+            print(f"\n  📊 全部板块 ({len(result.sectors)} 个):")
+            print(f"  {'板块':<20} {'分类':<8} {'连续天':<6} {'Top3':<5} {'趋势':<8} {'当前分':<8} {'评分趋势'}")
+            print(f"  {'-'*70}")
+            for s in result.sectors[:20]:
+                print(f"  {s.name:<20} {s.classification_cn:<8} {s.consecutive_days:<6} {s.top3_count:<5} {s.score_trend:>+7.1f} {s.current_score:>7.1f} {'↗' if s.score_trend > 0 else '↘' if s.score_trend < 0 else '→'}")
+            print()
+            return 0
+
+        # 模式2: 仅板块选股
+        if args.screen:
+            logger.info("模式: 板块选股 --screen %s", args.screen)
+            from src.services.stock_screener_service import StockScreenerService
+            from src.schemas.stock_screener_schema import ScreenerCriteria
+            import json as _json
+
+            service = StockScreenerService()
+            criteria = ScreenerCriteria(sector_name=args.screen)
+            result = service.screen(criteria)
+
+            print(f"\n市场状态: {result.regime.regime_label} (置信度={result.regime.confidence}, 建议仓位≤{result.regime.position_factor*100:.0f}%)")
+            print(f"板块: {result.sector_name}")
+            print(f"筛选漏斗: {result.total_considered} → L1({result.after_liquidity}) → L2({result.after_trend}) → L3({result.after_ranking})")
+            print(f"\n候选股票 ({len(result.candidates)}):")
+            print("-" * 70)
+            for i, c in enumerate(result.candidates, 1):
+                print(f"  #{i} {c.code} {c.name}")
+                print(f"     价格: {c.price:.2f}  涨跌: {c.change_pct:+.2f}%")
+                f = c.factors
+                print(f"     趋势:{f.trend_strength:.0f} RS:{f.rs_score:.0f} 量能:{f.volume_confirmation:.0f} "
+                      f"乖离:{f.bias_from_ma5:.0f} 涨停距:{f.limit_up_proximity:.0f} 龙头:{f.sector_leadership:.0f}")
+                print(f"     综合: {f.composite_score:.1f} | 均线: {c.ma_alignment} | 换手: {c.turnover_rate:.1f}%")
+                print()
+            print("-" * 70)
+            return 0
+
+        # 模式2: 仅大盘复盘
         if args.market_review:
             from src.analyzer import GeminiAnalyzer
             from src.core.market_review import run_market_review
@@ -922,6 +1205,36 @@ def main() -> int:
                     })
                 else:
                     logger.info("EventMonitor 已启用，但未加载到有效规则，跳过后台提醒任务")
+
+            # Playwright 板块数据爬虫后台任务
+            if config.enable_board_scraper and getattr(config, 'board_scraper_interval_minutes', 0) > 0:
+                try:
+                    from data_provider.board_scraper_fetcher import BoardScraperFetcher
+                    from src.services.board_scraper_storage import get_board_scraper_storage
+
+                    interval_minutes = getattr(config, 'board_scraper_interval_minutes', 60)
+
+                    def board_scraper_task():
+                        fetcher = BoardScraperFetcher(
+                            headless=True,
+                            browser_type=getattr(config, 'board_scraper_browser_type', 'chromium'),
+                        )
+                        try:
+                            data = fetcher.scrape_all()
+                            storage = get_board_scraper_storage()
+                            storage.save_scrape_result(data)
+                        finally:
+                            fetcher.close()
+
+                    background_tasks.append({
+                        "task": board_scraper_task,
+                        "interval_seconds": max(300, interval_minutes * 60),  # min 5min
+                        "run_immediately": False,
+                        "name": "board_scraper",
+                    })
+                    logger.info("[Main] 板块爬虫后台任务已注册 (interval=%dmin)", interval_minutes)
+                except Exception as e:
+                    logger.warning("[Main] 板块爬虫初始化失败: %s", e)
 
             run_with_schedule(
                 task=scheduled_task,

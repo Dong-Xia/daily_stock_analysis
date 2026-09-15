@@ -379,6 +379,35 @@ class TestBuiltinSkills(unittest.TestCase):
         # Verify all strategy names from YAML are loaded
         self.assertEqual(names, expected)
 
+    def test_validate_builtin_skill_field_ranges(self):
+        """All built-in YAML skills should have valid field value ranges."""
+        from src.agent.skills.base import SkillManager
+
+        manager = SkillManager()
+        manager.load_builtin_strategies()
+        skills = manager.list_skills()
+
+        VALID_CATEGORIES = {"trend", "reversal", "pattern", "framework", "general"}
+        VALID_CORE_RULES = set(range(1, 8))
+        VALID_REGIMES = {"trending_up", "trending_down", "sideways", "volatile", "sector_hot"}
+
+        for skill in skills:
+            with self.subTest(skill=skill.name):
+                self.assertIn(
+                    skill.category, VALID_CATEGORIES,
+                    f"{skill.name}: category '{skill.category}' not in {VALID_CATEGORIES}"
+                )
+                for rule in skill.core_rules:
+                    self.assertIn(
+                        rule, VALID_CORE_RULES,
+                        f"{skill.name}: core_rules value {rule} not in 1-7"
+                    )
+                for regime in skill.market_regimes:
+                    self.assertIn(
+                        regime, VALID_REGIMES,
+                        f"{skill.name}: market_regimes value '{regime}' not in {VALID_REGIMES}"
+                    )
+
 
 # ============================================================
 # Built-in tools import test

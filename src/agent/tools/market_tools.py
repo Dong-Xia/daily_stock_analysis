@@ -5,6 +5,7 @@ Market tools — wraps DataFetcherManager market-level methods as agent tools.
 Tools:
 - get_market_indices: major market index data
 - get_sector_rankings: sector performance rankings
+- get_market_overview: market breadth stats (up/down counts, limit up/down, total amount)
 """
 
 import logging
@@ -102,7 +103,51 @@ get_sector_rankings_tool = ToolDefinition(
 )
 
 
+# ============================================================
+# get_market_overview
+# ============================================================
+
+def _handle_get_market_overview() -> dict:
+    """Get market breadth overview — rising/falling stock counts, limit-up/down, total turnover.
+
+    Returns A-share market-wide statistics including:
+    - up_count: number of rising stocks
+    - down_count: number of falling stocks
+    - flat_count: number of flat/unchanged stocks
+    - limit_up_count: number of stocks hitting daily upper limit
+    - limit_down_count: number of stocks hitting daily lower limit
+    - total_amount: total market turnover (in CNY)
+    """
+    manager = _get_fetcher_manager()
+    stats = manager.get_market_stats()
+
+    if not stats:
+        return {"error": "No market overview data available"}
+
+    return {
+        "up_count": stats.get("up_count", 0),
+        "down_count": stats.get("down_count", 0),
+        "flat_count": stats.get("flat_count", 0),
+        "limit_up_count": stats.get("limit_up_count", 0),
+        "limit_down_count": stats.get("limit_down_count", 0),
+        "total_amount": stats.get("total_amount", 0),
+    }
+
+
+get_market_overview_tool = ToolDefinition(
+    name="get_market_overview",
+    description="Get A-share market breadth overview: number of rising/falling stocks, "
+                "limit-up/limit-down counts, and total market turnover. "
+                "Use this to assess overall market sentiment and decide position sizing. "
+                "Key thresholds: 3000+ rising = healthy market; < 3000 rising = caution.",
+    parameters=[],
+    handler=_handle_get_market_overview,
+    category="market",
+)
+
+
 ALL_MARKET_TOOLS = [
     get_market_indices_tool,
     get_sector_rankings_tool,
+    get_market_overview_tool,
 ]

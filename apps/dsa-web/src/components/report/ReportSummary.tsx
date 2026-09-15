@@ -4,6 +4,7 @@ import { ReportOverview } from './ReportOverview';
 import { ReportStrategy } from './ReportStrategy';
 import { ReportNews } from './ReportNews';
 import { ReportDetails } from './ReportDetails';
+import { TradingPrinciples } from './TradingPrinciples';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 
 interface ReportSummaryProps {
@@ -24,7 +25,7 @@ export const ReportSummary: React.FC<ReportSummaryProps> = ({
   // 使用 report id，因为 queryId 在批量分析时可能重复，且历史报告详情接口需要 recordId 来获取关联资讯和详情数据
   const recordId = report.meta.id;
 
-  const { meta, summary, strategy, details } = report;
+  const { meta, summary, strategy, details, tradingAnnotations } = report;
   const reportLanguage = normalizeReportLanguage(meta.reportLanguage);
   const text = getReportText(reportLanguage);
   const modelUsed = (meta.modelUsed || '').trim();
@@ -41,6 +42,9 @@ export const ReportSummary: React.FC<ReportSummaryProps> = ({
         details={details}
         isHistory={isHistory}
       />
+
+      {/* 交易原则可视化 */}
+      <TradingPrinciples annotations={tradingAnnotations} reportLanguage={reportLanguage} />
 
       {/* 策略点位区 */}
       <ReportStrategy strategy={strategy} language={reportLanguage} />

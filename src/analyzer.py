@@ -395,6 +395,18 @@ class AnalysisResult:
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
 
+    # ========== 周期共振（P1 Feature）==========
+    cycle_resonance: Optional[str] = None  # 多周期共振状态描述
+    cycle_resonance_level: Optional[str] = None  # 共振级别：三级共振/两级共振/无共振
+    cycle_resonance_score: Optional[int] = None  # 共振评分 0-10
+    weekly_trend: Optional[str] = None  # 周线趋势
+    daily_structure: Optional[str] = None  # 日线结构
+    hourly_signal: Optional[str] = None  # 小时线信号
+
+    # ========== 买点质量评分（P1 Feature）==========
+    buy_quality_score: Optional[int] = None  # 买点质量评分 0-10
+    buy_quality_factors: Optional[List[Dict[str, str]]] = None  # 评分因子明细
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -431,6 +443,14 @@ class AnalysisResult:
             'current_price': self.current_price,
             'change_pct': self.change_pct,
             'model_used': self.model_used,
+            'cycle_resonance': self.cycle_resonance,
+            'cycle_resonance_level': self.cycle_resonance_level,
+            'cycle_resonance_score': self.cycle_resonance_score,
+            'weekly_trend': self.weekly_trend,
+            'daily_structure': self.daily_structure,
+            'hourly_signal': self.hourly_signal,
+            'buy_quality_score': self.buy_quality_score,
+            'buy_quality_factors': self.buy_quality_factors,
         }
 
     def get_core_conclusion(self) -> str:
@@ -566,6 +586,14 @@ class GeminiAnalyzer:
                 "avg_cost": 平均成本,
                 "concentration": 筹码集中度,
                 "chip_health": "健康/一般/警惕"
+            },
+            "cycle_resonance": {
+                "weekly_trend": "周线趋势：上升/下降/震荡",
+                "daily_structure": "日线结构：回调结束/反弹中/整理中/突破中",
+                "hourly_signal": "小时线信号：止跌确认/突破确认/背离/未确认",
+                "resonance_level": "三级共振看多/两级共振偏多/无共振/多周期背离",
+                "resonance_score": 0-10,
+                "resonance_summary": "一句话说明当前多周期状态（如：周线上升趋势中，日线缩量回踩MA20，60分钟出现放量阳线确认止跌）"
             }
         },
 
@@ -583,6 +611,18 @@ class GeminiAnalyzer:
                 "secondary_buy": "次优买入点：XX元（在MA10附近）",
                 "stop_loss": "止损位：XX元（跌破MA20或X%）",
                 "take_profit": "目标位：XX元（前高/整数关口）"
+            },
+            "buy_quality": {
+                "quality_score": 0-10,
+                "quality_summary": "买点质量一句话总结",
+                "quality_factors": [
+                    {"name": "多周期共振", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "量价配合", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "乖离率合理", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "关键位置", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "大盘/板块环境", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "资金/筹码", "status": "✅/⚠️/❌", "detail": "说明"}
+                ]
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -716,6 +756,14 @@ class GeminiAnalyzer:
                 "avg_cost": 平均成本,
                 "concentration": 筹码集中度,
                 "chip_health": "健康/一般/警惕"
+            },
+            "cycle_resonance": {
+                "weekly_trend": "周线趋势：上升/下降/震荡",
+                "daily_structure": "日线结构：回调结束/反弹中/整理中/突破中",
+                "hourly_signal": "小时线信号：止跌确认/突破确认/背离/未确认",
+                "resonance_level": "三级共振看多/两级共振偏多/无共振/多周期背离",
+                "resonance_score": 0-10,
+                "resonance_summary": "一句话说明当前多周期状态"
             }
         },
 
@@ -733,6 +781,18 @@ class GeminiAnalyzer:
                 "secondary_buy": "次优入场位：XX元（更保守或确认后执行）",
                 "stop_loss": "止损位：XX元（失效条件或X%风险）",
                 "take_profit": "目标位：XX元（按阻力位/风险回报比制定）"
+            },
+            "buy_quality": {
+                "quality_score": 0-10,
+                "quality_summary": "买点质量一句话总结",
+                "quality_factors": [
+                    {"name": "多周期共振", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "量价配合", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "乖离率合理", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "关键位置", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "大盘/板块环境", "status": "✅/⚠️/❌", "detail": "说明"},
+                    {"name": "资金/筹码", "status": "✅/⚠️/❌", "detail": "说明"}
+                ]
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -1982,6 +2042,40 @@ class GeminiAnalyzer:
                 # 提取 dashboard 数据
                 dashboard = data.get('dashboard', None)
 
+                # 提取周期共振数据
+                cycle_resonance = None
+                cycle_resonance_level = None
+                cycle_resonance_score = None
+                weekly_trend = None
+                daily_structure = None
+                hourly_signal = None
+                if dashboard and isinstance(dashboard, dict):
+                    cr = dashboard.get('data_perspective', {}).get('cycle_resonance', {})
+                    if cr and isinstance(cr, dict):
+                        cycle_resonance = cr.get('resonance_summary')
+                        cycle_resonance_level = cr.get('resonance_level')
+                        cycle_resonance_score = cr.get('resonance_score')
+                        if isinstance(cycle_resonance_score, (int, float)):
+                            cycle_resonance_score = int(cycle_resonance_score)
+                        else:
+                            cycle_resonance_score = None
+                        weekly_trend = cr.get('weekly_trend')
+                        daily_structure = cr.get('daily_structure')
+                        hourly_signal = cr.get('hourly_signal')
+
+                # 提取买点质量评分
+                buy_quality_score = None
+                buy_quality_factors = None
+                if dashboard and isinstance(dashboard, dict):
+                    bq = dashboard.get('battle_plan', {}).get('buy_quality', {})
+                    if bq and isinstance(bq, dict):
+                        qs = bq.get('quality_score')
+                        if isinstance(qs, (int, float)):
+                            buy_quality_score = int(qs)
+                        qf = bq.get('quality_factors')
+                        if isinstance(qf, list):
+                            buy_quality_factors = qf
+
                 # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
                 ai_stock_name = data.get('stock_name')
                 if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
@@ -2009,6 +2103,16 @@ class GeminiAnalyzer:
                     report_language=report_language,
                     # 决策仪表盘
                     dashboard=dashboard,
+                    # 周期共振
+                    cycle_resonance=cycle_resonance,
+                    cycle_resonance_level=cycle_resonance_level,
+                    cycle_resonance_score=cycle_resonance_score,
+                    weekly_trend=weekly_trend,
+                    daily_structure=daily_structure,
+                    hourly_signal=hourly_signal,
+                    # 买点质量
+                    buy_quality_score=buy_quality_score,
+                    buy_quality_factors=buy_quality_factors,
                     # 走势分析
                     trend_analysis=data.get('trend_analysis', ''),
                     short_term_outlook=data.get('short_term_outlook', ''),

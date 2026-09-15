@@ -1107,10 +1107,87 @@ class TushareFetcher(BaseFetcher):
         
         # 获取为空或者接口调用失败，返回 None
         return None
-    
-    
 
-    
+    def get_board_members(self, board_name: str, board_type: str = "industry") -> Optional[pd.DataFrame]:
+        if self._api is None:
+            return None
+
+        result = self._get_board_members_by_index(board_name)
+        if result is not None:
+            return result
+
+        return self._get_board_members_by_stock_basic(board_name)
+
+    def _get_board_members_by_index(self, board_name: str) -> Optional[pd.DataFrame]:
+        if self._api is None:
+            return None
+        try:
+            df_class = self._call_api_with_rate_limit("index_classify")
+            if df_class is None or df_class.empty:
+                return None
+
+            target = board_name.strip()
+            match = None
+            for col in ("l3_name", "l2_name", "l1_name"):
+                if col not in df_class.columns:
+                    continue
+                mask = df_class[col].astype(str).str.contains(target, na=False, case=False)
+                if mask.any():
+                    match = df_class.loc[mask].iloc[0]
+                    break
+
+            if match is None:
+                return None
+
+            l3_code = str(match.get("l3_code", ""))
+            if not l3_code:
+                return None
+
+            df = self._call_api_with_rate_limit("index_member_all", l3_code=l3_code)
+            if df is None or df.empty:
+                return None
+
+            df = df.copy()
+            if "ts_code" in df.columns:
+                df["code"] = df["ts_code"].astype(str).str.split(".").str[0]
+            if "name" in df.columns:
+                df["name"] = df["name"].astype(str)
+
+            available = [c for c in ("code", "name") if c in df.columns]
+            if not available:
+                return None
+            return df[available].copy()
+        except Exception:
+            return None
+
+    def _get_board_members_by_stock_basic(self, board_name: str) -> Optional[pd.DataFrame]:
+        if self._api is None:
+            return None
+        try:
+            if not hasattr(self, "_stock_basic_cache") or self._stock_basic_cache is None:
+                self._stock_basic_cache = self._call_api_with_rate_limit(
+                    "stock_basic",
+                    exchange="",
+                    list_status="L",
+                    fields="ts_code,name,industry",
+                )
+            df = self._stock_basic_cache
+            if df is None or df.empty:
+                return None
+
+            target = board_name.strip()
+            mask = df["industry"].astype(str).str.contains(target, na=False, case=False)
+            if not mask.any():
+                return None
+
+            result = df.loc[mask, ["ts_code", "name"]].copy()
+            result["code"] = result["ts_code"].astype(str).str.split(".").str[0]
+            logger.info(f"[Tushare] stock_basic 匹配 '{target}': {len(result)} 只")
+            return result[["code", "name"]]
+        except Exception as e:
+            logger.debug(f"[Tushare] stock_basic fallback 失败: {e}")
+            return None
+
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
         获取筹码分布数据

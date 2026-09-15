@@ -28,6 +28,13 @@ from api.v1.schemas.history import (
     ReportStrategy,
     ReportDetails,
     MarkdownReportResponse,
+    TradingAnnotations,
+    CycleStructure,
+    TrendConfirmation,
+    HeatLabel,
+    CycleResonance,
+    BuyQuality,
+    BuyQualityFactor,
 )
 from api.v1.schemas.common import ErrorResponse
 from src.storage import DatabaseManager
@@ -44,6 +51,45 @@ from src.utils.data_processing import (
     extract_fundamental_detail_fields,
     extract_board_detail_fields,
 )
+
+
+def _extract_cycle_resonance(raw_result: dict) -> Optional[CycleResonance]:
+    """从 raw_result 中提取多周期共振信号"""
+    if not isinstance(raw_result, dict):
+        return None
+    cr = raw_result.get("cycle_resonance")
+    if not cr:
+        return None
+    return CycleResonance(
+        weekly_trend=raw_result.get("weekly_trend", ""),
+        daily_structure=raw_result.get("daily_structure", ""),
+        hourly_signal=raw_result.get("hourly_signal", ""),
+        resonance_level=raw_result.get("cycle_resonance_level", ""),
+        resonance_score=raw_result.get("cycle_resonance_score"),
+        resonance_summary=cr,
+    )
+
+
+def _extract_buy_quality(raw_result: dict) -> Optional[BuyQuality]:
+    """从 raw_result 中提取买点质量评分"""
+    if not isinstance(raw_result, dict):
+        return None
+    bq_score = raw_result.get("buy_quality_score")
+    bq_factors = raw_result.get("buy_quality_factors") or []
+    if bq_score is None and not bq_factors:
+        return None
+    return BuyQuality(
+        quality_score=bq_score,
+        quality_summary="",
+        quality_factors=[
+            BuyQualityFactor(
+                name=f.get("name", ""),
+                status=f.get("status", ""),
+                detail=f.get("detail", ""),
+            )
+            for f in bq_factors if isinstance(f, dict)
+        ],
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +152,8 @@ def get_history_list(
                 report_type=item.get("report_type"),
                 sentiment_score=item.get("sentiment_score"),
                 operation_advice=item.get("operation_advice"),
+                heat_label=item.get("heat_label"),
+                trend_status=item.get("trend_status"),
                 created_at=item.get("created_at")
             )
             for item in result.get("items", [])
@@ -317,11 +365,45 @@ def get_history_detail(
             sector_rankings=extracted_boards.get("sector_rankings"),
         )
         
+        trading_annotations = None
+        try:
+            market_snapshot = raw_result.get("market_snapshot", {}) or {} if isinstance(raw_result, dict) else {}
+            ann_raw = market_snapshot.get("trading_annotations", {}) or {}
+            if ann_raw:
+                cs_raw = ann_raw.get("cycle_structure", {}) or {}
+                tc_raw = ann_raw.get("trend_confirmation", {}) or {}
+                hl_raw = ann_raw.get("heat_label", {}) or {}
+                trading_annotations = TradingAnnotations(
+                    cycle_structure=CycleStructure(
+                        long_term=cs_raw.get("long_term", ""),
+                        medium_term=cs_raw.get("medium_term", ""),
+                        short_term=cs_raw.get("short_term", ""),
+                        alignment=cs_raw.get("alignment", ""),
+                    ),
+                    trend_confirmation=TrendConfirmation(
+                        status=tc_raw.get("status", ""),
+                        status_en=tc_raw.get("status_en", ""),
+                        signal_strength=tc_raw.get("signal_strength", ""),
+                        bias_warning=tc_raw.get("bias_warning", ""),
+                    ),
+                    heat_label=HeatLabel(
+                        label=hl_raw.get("label", ""),
+                        label_en=hl_raw.get("label_en", ""),
+                        turnover_desc=hl_raw.get("turnover_desc", ""),
+                        momentum_desc=hl_raw.get("momentum_desc", ""),
+                    ),
+                    cycle_resonance=_extract_cycle_resonance(raw_result),
+                    buy_quality=_extract_buy_quality(raw_result),
+                )
+        except Exception:
+            trading_annotations = None
+
         return AnalysisReport(
             meta=meta,
             summary=summary,
             strategy=strategy,
-            details=details
+            details=details,
+            tradingAnnotations=trading_annotations,
         )
         
     except HTTPException:

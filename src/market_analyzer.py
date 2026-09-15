@@ -31,13 +31,17 @@ logger = logging.getLogger(__name__)
 _ENGLISH_SECTION_PATTERNS = {
     "market_summary": r"###\s*(?:1\.\s*)?Market Summary",
     "index_commentary": r"###\s*(?:2\.\s*)?(?:Index Commentary|Major Indices)",
-    "sector_highlights": r"###\s*(?:4\.\s*)?(?:Sector Highlights|Sector/Theme Highlights)",
+    "sector_highlights": r"###\s*(?:4\.\s*)?(?:Sector Highlights|Sector\s*/\s*(?:Theme|Concept) Highlights)",
+    "limit_up_quality": r"###\s*(?:6\.\s*)?Limit-up Quality",
+    "sentiment_cycle": r"###\s*(?:7\.\s*)?Sentiment Cycle",
 }
 
 _CHINESE_SECTION_PATTERNS = {
     "market_summary": r"###\s*一、市场总结",
     "index_commentary": r"###\s*二、(?:指数点评|主要指数)",
     "sector_highlights": r"###\s*四、(?:热点解读|板块表现)",
+    "limit_up_quality": r"###\s*五、涨停质量分析",
+    "sentiment_cycle": r"###\s*六、情绪周期定位",
 }
 
 
@@ -89,6 +93,9 @@ class MarketOverview:
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
+
+    # 热点分析增强数据（概念板块、资金流、人气榜、涨停板、北向资金）
+    hotspot_summary: Optional[Dict[str, Any]] = None
 
 
 class MarketAnalyzer:
@@ -185,6 +192,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 - Read index direction first, then confirm liquidity structure, and finally test sector persistence.
 - Every conclusion must map to position sizing, trading pace, and risk-control actions.
 - Base judgments on today's data and the latest 3-day news flow without inventing unverified information.
+- Limit-up quality determines next session's premium; sentiment cycle determines positioning attitude.
 
 ### Analysis Dimensions
 - Trend Structure: Determine whether the market is in an uptrend, range, or defensive phase.
@@ -199,20 +207,33 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
   - Whether leading sectors have clear event catalysts
   - Whether sector leaders are pulling the group higher
   - Whether weakness is broadening across lagging sectors
+- Limit-up Quality: Evaluate the structural quality of limit-up stocks and the sustainability of profit-making effects.
+  - Ratio of opening-auction limit-ups vs intraday limit-ups vs failed limit-ups
+  - Height and completeness of the consecutive-limit-up chain
+  - Whether the failed-limit-up ratio is elevated
+  - Next-session premium on limit-up stocks
+- Sentiment Cycle: Identify the current market sentiment phase and the next direction.
+  - Which phase: initial trial / main up-trend / high-level oscillation / main downtrend
+  - Whether the leader stock is showing divergence or peaking signals
+  - Whether loss-making effects are spreading (limit-down count, large-loss stocks)
+  - Whether sentiment is approaching an extreme (ice point or euphoria)
 
 ### Action Framework
-- Offensive: indices rise in sync, turnover expands, and core themes strengthen.
+- Offensive: indices rise in sync, turnover expands, core themes strengthen, and sentiment is in the main up-trend phase.
 - Balanced: index divergence or low-volume consolidation; keep sizing controlled and wait for confirmation.
-- Defensive: indices weaken and laggards broaden; prioritize risk control and de-risking."""
+- Defensive: indices weaken and laggards broaden; prioritize risk control and de-risking.
+- Yesterday's Prediction Review: on the next review day, revisit yesterday's prediction, analyze why it was right or wrong, and refine the analytical framework."""
 
     def _get_strategy_markdown_block(self, review_language: str | None = None) -> str:
         review_language = review_language or self._get_review_language()
         if not (self.region == "cn" and review_language == "en"):
             return self.strategy.to_markdown_block()
-        return """### 6. Strategy Framework
+        return """### 8. Strategy Framework
 - **Trend Structure**: Determine whether the market is in an uptrend, range, or defensive phase.
 - **Liquidity & Sentiment**: Track breadth, turnover expansion, and whether leaders are diverging.
 - **Leading Themes**: Focus on sectors with catalysts and sustained leadership while avoiding broadening weakness.
+- **Limit-up Quality**: Assess the structural quality of limit-up stocks and the sustainability of profit-making effects.
+- **Sentiment Cycle**: Identify sentiment phase (initial trial / main up-trend / high-level oscillation / main downtrend).
 """
 
     def _get_market_mood_text(self, mood_key: str, review_language: str | None = None) -> str:
@@ -255,7 +276,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
-        
+            self._get_hotspot_data(overview)
+
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
         
@@ -338,6 +360,30 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.error(f"[大盘] 获取板块涨跌榜失败: {e}")
+
+    def _get_hotspot_data(self, overview: MarketOverview):
+        """获取增强热点数据（概念板块、资金流、人气榜、涨停板、北向资金）"""
+        try:
+            from src.core.sector_analyzer import SectorAnalyzer
+
+            logger.info("[大盘] 获取热点增强数据...")
+            analyzer = SectorAnalyzer(data_manager=self.data_manager)
+            raw_data = analyzer.fetch_hotspot_data()
+            overview.hotspot_summary = analyzer.build_hotspot_summary(raw_data)
+
+            if overview.hotspot_summary:
+                top = overview.hotspot_summary.get("top_concepts", [])
+                limit_up = overview.hotspot_summary.get("limit_up_count", 0)
+                north = overview.hotspot_summary.get("north_flow", {})
+                logger.info(
+                    f"[大盘] 热点数据: 热门概念{len(top)}个, 涨停{limit_up}只, "
+                    f"北向{north.get('net_inflow_yi', 'N/A')}亿"
+                )
+            else:
+                logger.info("[大盘] 热点增强数据无有效内容，继续原有流程")
+        except Exception as e:
+            logger.warning(f"[大盘] 热点增强数据获取失败（fail-open）: {e}")
+            overview.hotspot_summary = None
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -547,6 +593,22 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 lines.append(f"> 💧 领跌: {bot}")
         return "\n".join(lines)
 
+    def _build_hotspot_prompt_block(self, overview: MarketOverview) -> str:
+        """Build hotspot data block for the LLM prompt."""
+        hotspot = overview.hotspot_summary
+        if not hotspot:
+            return ""
+
+        try:
+            from src.core.sector_analyzer import SectorAnalyzer
+            analyzer = SectorAnalyzer(data_manager=self.data_manager)
+            return analyzer.build_hotspot_markdown(
+                hotspot,
+                language=self._get_review_language(),
+            )
+        except Exception:
+            return ""
+
     def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
         """构建复盘报告 Prompt"""
         review_language = self._get_review_language()
@@ -607,6 +669,8 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
             else:
                 sector_block = "## 板块表现\n（美股暂无板块涨跌数据）"
 
+        hotspot_block = self._build_hotspot_prompt_block(overview)
+
         data_no_indices_hint = (
             "注意：由于行情数据获取失败，请主要根据【市场新闻】进行定性分析和总结，不要编造具体的指数点位。"
             if not indices_text
@@ -649,6 +713,8 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 
 {sector_block}
 
+{hotspot_block}
+
 ## Market News
 {news_placeholder}
 
@@ -671,17 +737,26 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 ### 3. Fund Flows
 (Interpret what turnover, participation, and flow signals imply.)
 
-### 4. Sector Highlights
-(Analyze the drivers behind the leading and lagging sectors or themes.)
+### 4. Sector / Concept Highlights
+(Analyze the drivers behind the leading and lagging sectors or concept themes. Use concept board data and fund flow to explain rotation patterns. Identify the three-dimensional mainline structure: leader stocks, fill-in stocks, and rotation direction. Assess mainline persistence.)
 
-### 5. Outlook
-(Provide the near-term outlook based on price action and news.)
+### 5. Hotspot & Sentiment
+(Based on the hotspot data above: identify the strongest themes, consecutive limit-up leaders, north-bound capital direction, and popularity rankings. Interpret market sentiment.)
 
-### 6. Risk Alerts
-(List the main risks to monitor.)
+### 6. Limit-up Quality Analysis
+(Analyze the structural quality of today's limit-up stocks: ratio of opening-auction limit-ups vs intraday limit-ups vs failed limit-ups, the completeness of the consecutive-limit-up chain, and the failed-limit-up ratio. Assess whether the profit-making effect is sustainable. Briefly review the next-session premium of yesterday's limit-up stocks.)
 
-### 7. Strategy Plan
-(Provide an offensive/balanced/defensive stance, a position-sizing guideline, one invalidation trigger, and end with “For reference only, not investment advice.”)
+### 7. Sentiment Cycle Positioning
+(Identify the current market sentiment phase — initial trial / main up-trend / high-level oscillation / main downtrend, and determine the next direction. Reference indicators: leader stock status, whether loss-making effects are spreading (limit-down count, large-loss stocks), sentiment extreme signals, consecutive-limit-up promotion rate.)
+
+### 8. Outlook
+(Provide the near-term outlook based on price action, sentiment cycle position, and news. Include clear directional rationale.)
+
+### 9. Risk Alerts
+(List the main risks to monitor, including sentiment fade risk, index breakdown risk, and theme retreat risk.)
+
+### 10. Strategy Plan
+(First review yesterday's prediction: was the bullish/bearish/range-bound call correct, what went wrong, and how to refine the analytical framework. Then provide an offensive/balanced/defensive stance, a position-sizing guideline, one invalidation trigger, and end with “For reference only, not investment advice.”)
 
 ---
 
@@ -711,6 +786,8 @@ Output the report content directly, no extra commentary.
 
 {sector_block}
 
+{hotspot_block}
+
 ## 市场新闻
 {news_placeholder}
 
@@ -731,19 +808,25 @@ Output the report content directly, no extra commentary.
 （{self._get_index_hint()}）
 
 ### 三、资金动向
-（解读成交额流向的含义）
+（解读成交额流向的含义，结合北向资金和板块资金流进行分析）
 
 ### 四、热点解读
-（分析领涨领跌板块背后的逻辑和驱动因素）
+（分析领涨领跌板块背后的逻辑和驱动因素。如果提供了概念板块数据和资金流数据，请重点分析：热门概念板块的轮动逻辑、高连板股票的带动效应、人气榜股票与主线的关系。同时分析主线三维度结构：辨识龙头股、补涨股与切换方向，评估主线延续性）
 
-### 五、后市展望
-（结合当前走势和新闻，给出明日市场预判）
+### 五、涨停质量分析
+（分析今日涨停股的结构质量：一字板与换手板比例、连板梯队完整性、炸板率高低，判断赚钱效应是否可持续。同时简要回顾昨日涨停股的次日溢价表现）
 
-### 六、风险提示
-（需要关注的风险点）
+### 六、情绪周期定位
+（定位当前市场情绪所处阶段——低位试错/主升/高位震荡/主跌，判断明日情绪演化方向。参考指标：龙头股状态、亏钱效应是否蔓延（跌停家数、大面股）、情绪极值信号、连板晋级率）
 
-### 七、策略计划
-（给出进攻/均衡/防守结论，对应仓位建议，并给出一个触发失效条件；最后补充“建议仅供参考，不构成投资建议”。）
+### 七、后市展望
+（结合当前走势、情绪周期位置和新闻，给出明日市场预判。需包含明确的方向判断依据）
+
+### 八、风险提示
+（需要关注的风险点，包括情绪退潮风险、指数破位风险、题材退潮风险等）
+
+### 九、策略计划
+（首先回顾昨日预判并对错分析：昨日看多/看空/震荡判断是否正确，错在哪里，如何修正分析框架。然后给出进攻/均衡/防守结论，对应仓位建议，并给出一个触发失效条件。最后补充“建议仅供参考，不构成投资建议”）
 
 ---
 
@@ -818,9 +901,13 @@ Today's {self._get_market_scope_name(template_language)} showed **{market_mood}*
 {indices_text or "- No index data available"}
 {stats_section}
 {sector_section}
-### 5. Risk Alerts
-Market conditions can change quickly. The data above is for reference only and does not constitute investment advice.
+### 5. Limit-up Quality
+(Data-driven template; review the limit-up/limit-down structure above for quality signals.)
 
+### 6. Sentiment Cycle
+(Data-driven template; assess market mood and breadth from the statistics above.)
+
+### 7. Strategy Framework
 {self._get_strategy_markdown_block(template_language)}
 
 ---
@@ -858,7 +945,13 @@ Market conditions can change quickly. The data above is for reference only and d
 {indices_text}
 {stats_section}
 {sector_section}
-### 五、风险提示
+### 五、涨停质量分析
+（模板模式）今日涨停{overview.limit_up_count}家，跌停{overview.limit_down_count}家。请结合具体数据分析涨停板的结构质量与赚钱效应持续性。
+
+### 六、情绪周期定位
+（模板模式）基于涨跌家数和涨跌停数据判断当前市场情绪阶段，关注是否出现情绪极值信号。
+
+### 七、风险提示
 市场有风险，投资需谨慎。以上数据仅供参考，不构成投资建议。
 
 {strategy_summary}

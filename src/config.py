@@ -679,6 +679,15 @@ class Config:
     enable_chip_distribution: bool = True
     # 东财接口补丁开关
     enable_eastmoney_patch: bool = False
+    # === Playwright 浏览器爬虫配置（可选数据源）===
+    # 启用 Playwright 浏览器爬虫
+    enable_board_scraper: bool = False
+    # 浏览器类型：chromium / firefox / webkit
+    board_scraper_browser_type: str = "chromium"
+    # 数据源优先级（逗号分隔）
+    board_scraper_source_priority: str = "eastmoney"
+    # 定时采集间隔（分钟）；0 表示仅手动触发
+    board_scraper_interval_minutes: int = 0
     # 实时行情数据源优先级（逗号分隔）
     # 推荐顺序：tencent > akshare_sina > efinance > akshare_em > tushare
     # - tencent: 腾讯财经，有量比/换手率/市盈率等，单股查询稳定（推荐）
@@ -712,6 +721,20 @@ class Config:
     portfolio_risk_stop_loss_near_ratio: float = 0.8
     portfolio_risk_lookback_days: int = 180
     portfolio_fx_update_enabled: bool = True
+
+    # === 市场状态分类器配置 ===
+    screener_min_avg_amount_yi: float = 1.0
+    screener_min_turnover_rate: float = 1.0
+    screener_rs_lookback_days: int = 20
+    screener_top_n_ratio: float = 0.3
+    screener_max_candidates: int = 10
+    # JSON: factor→weight, e.g. '{"trend_strength":0.25,"rs_score":0.25,"volume_confirmation":0.15,"bias_from_ma5":0.10,"limit_up_proximity":0.10,"sector_leadership":0.15}'
+    screener_score_weights: str = '{"trend_strength":0.25,"rs_score":0.25,"volume_confirmation":0.15,"bias_from_ma5":0.10,"limit_up_proximity":0.10,"sector_leadership":0.15}'
+    # JSON: dimension→weight, e.g. '{"trend":0.35,"volume":0.20,"breadth":0.20,"volatility":0.10,"sentiment":0.15}'
+    regime_dimension_weights: str = '{"trend":0.35,"volume":0.20,"breadth":0.20,"volatility":0.10,"sentiment":0.15}'
+    # 基本面选股（--fundamental / /stocks/fundamental）评分后输出的最大股票数；
+    # 与板块选股的 SCREENER_MAX_CANDIDATES 是两个不同筛选器的独立上限
+    fundamental_max_candidates: int = 50
 
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
@@ -1367,6 +1390,17 @@ class Config:
             enable_chip_distribution=os.getenv('ENABLE_CHIP_DISTRIBUTION', 'true').lower() == 'true',
             # 东财接口补丁开关
             enable_eastmoney_patch=os.getenv('ENABLE_EASTMONEY_PATCH', 'false').lower() == 'true',
+            # Playwright 浏览器爬虫配置
+            enable_board_scraper=os.getenv('ENABLE_BOARD_SCRAPER', 'false').lower() == 'true',
+            board_scraper_browser_type=os.getenv('BOARD_SCRAPER_BROWSER_TYPE', 'chromium'),
+            board_scraper_source_priority=os.getenv('BOARD_SCRAPER_SOURCE_PRIORITY', 'eastmoney'),
+            board_scraper_interval_minutes=parse_env_int(
+                os.getenv('BOARD_SCRAPER_INTERVAL_MINUTES'),
+                0,
+                field_name='BOARD_SCRAPER_INTERVAL_MINUTES',
+                minimum=0,
+                maximum=1440,
+            ),
             # 实时行情数据源优先级：
             # - tencent: 腾讯财经，有量比/换手率/PE/PB等，单股查询稳定（推荐）
             # - akshare_sina: 新浪财经，基本行情稳定，但无量比
@@ -1431,7 +1465,55 @@ class Config:
                 field_name='PORTFOLIO_RISK_LOOKBACK_DAYS',
                 minimum=1,
             ),
-            portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true'
+            portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true',
+            screener_min_avg_amount_yi=parse_env_float(
+                os.getenv('SCREENER_MIN_AVG_AMOUNT_YI'),
+                1.0,
+                field_name='SCREENER_MIN_AVG_AMOUNT_YI',
+                minimum=0.1,
+            ),
+            screener_min_turnover_rate=parse_env_float(
+                os.getenv('SCREENER_MIN_TURNOVER_RATE'),
+                1.0,
+                field_name='SCREENER_MIN_TURNOVER_RATE',
+                minimum=0.1,
+            ),
+            screener_rs_lookback_days=parse_env_int(
+                os.getenv('SCREENER_RS_LOOKBACK_DAYS'),
+                20,
+                field_name='SCREENER_RS_LOOKBACK_DAYS',
+                minimum=5,
+                maximum=120,
+            ),
+            screener_top_n_ratio=parse_env_float(
+                os.getenv('SCREENER_TOP_N_RATIO'),
+                0.3,
+                field_name='SCREENER_TOP_N_RATIO',
+                minimum=0.05,
+                maximum=1.0,
+            ),
+            screener_max_candidates=parse_env_int(
+                os.getenv('SCREENER_MAX_CANDIDATES'),
+                10,
+                field_name='SCREENER_MAX_CANDIDATES',
+                minimum=1,
+                maximum=50,
+            ),
+            fundamental_max_candidates=parse_env_int(
+                os.getenv('FUNDAMENTAL_MAX_CANDIDATES'),
+                50,
+                field_name='FUNDAMENTAL_MAX_CANDIDATES',
+                minimum=1,
+                maximum=500,
+            ),
+            screener_score_weights=os.getenv(
+                'SCREENER_SCORE_WEIGHTS',
+                '{"trend_strength":0.25,"rs_score":0.25,"volume_confirmation":0.15,"bias_from_ma5":0.10,"limit_up_proximity":0.10,"sector_leadership":0.15}',
+            ),
+            regime_dimension_weights=os.getenv(
+                'REGIME_DIMENSION_WEIGHTS',
+                '{"trend":0.35,"volume":0.20,"breadth":0.20,"volatility":0.10,"sentiment":0.15}',
+            ),
         )
     
     @classmethod
@@ -1889,9 +1971,9 @@ class Config:
             # Prepend tushare so the paid source is tried first
             import logging
             logger = logging.getLogger(__name__)
-            resolved = f'tushare,{default_priority}'
+            resolved = f'{default_priority},tushare'
             logger.info(
-                f"TUSHARE_TOKEN detected, auto-injecting tushare into realtime priority: {resolved}"
+                f"TUSHARE_TOKEN detected, appending tushare to realtime priority (end): {resolved}"
             )
             return resolved
 

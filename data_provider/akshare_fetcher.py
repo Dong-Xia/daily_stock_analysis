@@ -267,18 +267,14 @@ class AkshareFetcher(BaseFetcher):
     name = "AkshareFetcher"
     priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
     
+    _sina_label_cache: Dict[str, Dict[str, str]] = {}
+    _sina_label_cache_time: Dict[str, float] = {}
+    _sina_label_ttl = 3600
+
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
-        """
-        初始化 AkshareFetcher
-        
-        Args:
-            sleep_min: 最小休眠时间（秒）
-            sleep_max: 最大休眠时间（秒）
-        """
         self.sleep_min = sleep_min
         self.sleep_max = sleep_max
         self._last_request_time: Optional[float] = None
-        # 东财补丁开启才执行打补丁操作
         if get_config().enable_eastmoney_patch:
             eastmoney_patch()
     
@@ -1620,6 +1616,16 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[Akshare] 获取指数行情失败: {e}")
             return None
 
+    def get_a_stock_realtime_batch(self) -> pd.DataFrame:
+        """获取全A股实时行情批量数据（带缓存和重试）。
+
+        复用 _get_stock_realtime_quote_em 的缓存机制，
+        返回完整的 DataFrame（包括代码、名称、最新价、涨跌幅、换手率等）。
+        """
+        dummy_code = "__batch__"
+        self._get_stock_realtime_quote_em(dummy_code)
+        return _realtime_cache.get("data", pd.DataFrame())
+
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """
         获取市场涨跌统计
@@ -1803,6 +1809,445 @@ class AkshareFetcher(BaseFetcher):
         
         except Exception as e:
             logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")
+            return None
+
+    def get_board_members(self, board_name: str, board_type: str = "industry") -> Optional[pd.DataFrame]:
+        """
+        获取板块成分股列表
+
+        数据源优先级：
+        1. 东财接口 (ak.stock_board_industry_cons_em / stock_board_concept_cons_em)
+        2. 新浪接口 (ak.stock_sector_detail) - 通过 label 映射获取
+
+        Args:
+            board_name: 板块名称（如 "半导体"、"人工智能"）
+            board_type: 板块类型，"industry"(行业板块) 或 "concept"(概念板块)
+
+        Returns:
+            DataFrame 包含成分股代码、名称、涨跌幅等，获取失败返回 None
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            if board_type == "concept":
+                logger.info(f"[API调用] ak.stock_board_concept_cons_em(symbol={board_name}) 获取概念板块成分股...")
+                df = ak.stock_board_concept_cons_em(symbol=board_name)
+            else:
+                logger.info(f"[API调用] ak.stock_board_industry_cons_em(symbol={board_name}) 获取行业板块成分股...")
+                df = ak.stock_board_industry_cons_em(symbol=board_name)
+
+            if df is not None and not df.empty:
+                return self._normalize_board_members(df, source="em")
+        except Exception as e:
+            logger.warning(f"[Akshare] 东财获取板块 {board_name} 成分股失败: {e}，尝试新浪接口")
+
+        try:
+            return self._get_board_members_from_sina(board_name, board_type)
+        except Exception as e:
+            logger.error(f"[Akshare] 新浪获取板块 {board_name} 成分股也失败: {e}")
+            return None
+
+    def _get_board_members_from_sina(self, board_name: str, board_type: str = "industry") -> Optional[pd.DataFrame]:
+        import akshare as ak
+
+        indicator = '概念' if board_type == 'concept' else '行业'
+        cache_key = indicator
+        now = time.time()
+
+        label_map = self._sina_label_cache.get(cache_key)
+        cache_time = self._sina_label_cache_time.get(cache_key, 0)
+        if label_map is None or now - cache_time > self._sina_label_ttl:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info(f"[API调用] ak.stock_sector_spot(indicator={indicator}) 获取新浪板块列表...")
+            sectors_df = ak.stock_sector_spot(indicator=indicator)
+            if sectors_df is None or sectors_df.empty:
+                logger.warning(f"[Akshare] 新浪板块列表为空")
+                return None
+            label_map = dict(zip(sectors_df['板块'], sectors_df['label']))
+            self._sina_label_cache[cache_key] = label_map
+            self._sina_label_cache_time[cache_key] = now
+
+        label = label_map.get(board_name)
+        if label is None:
+            for sina_name, lbl in label_map.items():
+                if board_name in sina_name or sina_name in board_name:
+                    label = lbl
+                    break
+
+        if label is None:
+            logger.warning(f"[Akshare] 未在新浪找到板块: {board_name}")
+            return None
+
+        logger.info(f"[Akshare] 新浪板块 {board_name} -> label={label}")
+
+        self._enforce_rate_limit()
+        logger.info(f"[API调用] ak.stock_sector_detail(sector={label}) 获取成分股...")
+        df = ak.stock_sector_detail(sector=label)
+
+        if df is None or df.empty:
+            logger.warning(f"[Akshare] 新浪板块 {board_name} 成分股为空")
+            return None
+
+        return self._normalize_board_members(df, source="sina")
+
+    def _normalize_board_members(self, df: pd.DataFrame, source: str = "em") -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+
+        if source == "em":
+            column_mapping = {
+                "代码": "code",
+                "名称": "name",
+                "涨跌幅": "change_pct",
+                "最新价": "price",
+                "换手率": "turnover_rate",
+                "成交量": "volume",
+                "成交额": "amount",
+            }
+        else:
+            column_mapping = {
+                "code": "code",
+                "name": "name",
+                "changepercent": "change_pct",
+                "trade": "price",
+                "turnoverratio": "turnover_rate",
+                "volume": "volume",
+                "amount": "amount",
+            }
+
+        for old_col, new_col in column_mapping.items():
+            if old_col in df.columns:
+                df.rename(columns={old_col: new_col}, inplace=True)
+
+        numeric_cols = ["change_pct", "price", "turnover_rate", "volume", "amount"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        logger.info(f"[Akshare] 板块成分股获取成功 ({source}): {len(df)} 只")
+        return df
+
+    # ================================================================
+    #  热点分析增强方法 (Hotspot Analysis Enhancement)
+    # ================================================================
+
+    def get_concept_board_rankings(self, n: int = 20) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        """
+        获取概念板块涨跌榜
+
+        与 get_sector_rankings (行业板块) 对称，但使用概念板块接口。
+
+        数据源优先级：
+        1. 东财接口 (ak.stock_board_concept_name_em)
+        2. 新浪接口 (ak.stock_sector_spot(indicator='概念'))
+
+        Args:
+            n: 返回前 n 个板块
+
+        Returns:
+            Tuple: (领涨概念板块列表, 领跌概念板块列表)，每项包含 name/change_pct
+        """
+        import akshare as ak
+
+        def _rank_top_n(df: pd.DataFrame, change_col: str, name_col: str, n: int) -> Tuple[list, list]:
+            df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+            df = df.dropna(subset=[change_col])
+            top = df.nlargest(n, change_col)
+            bottom = df.nsmallest(n, change_col)
+            top_sectors = [
+                {'name': row[name_col], 'change_pct': row[change_col]}
+                for _, row in top.iterrows()
+            ]
+            bottom_sectors = [
+                {'name': row[name_col], 'change_pct': row[change_col]}
+                for _, row in bottom.iterrows()
+            ]
+            return top_sectors, bottom_sectors
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_board_concept_name_em() 获取概念板块排行...")
+            df = ak.stock_board_concept_name_em()
+            if df is not None and not df.empty:
+                change_col = '涨跌幅'
+                name_col = '板块名称'
+                return _rank_top_n(df, change_col, name_col, n)
+        except Exception as e:
+            logger.warning(f"[Akshare] 东财获取概念板块排行失败: {e}，尝试新浪接口")
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_sector_spot(indicator='概念') 获取概念板块排行(新浪)...")
+            df = ak.stock_sector_spot(indicator='概念')
+            if df is None or df.empty:
+                return None
+            change_col = '涨跌幅'
+            name_col = '板块'
+            return _rank_top_n(df, change_col, name_col, n)
+        except Exception as e:
+            logger.error(f"[Akshare] 新浪获取概念板块排行也失败: {e}")
+            return None
+
+    def get_hot_rankings(self, n: int = 30) -> Optional[List[Dict]]:
+        """
+        获取东方财富人气榜（热门股票排名）
+
+        数据源：ak.stock_hot_rank_em()
+
+        Args:
+            n: 返回前 n 只热门股票
+
+        Returns:
+            List[Dict]: 每项包含 code/name/price/change_pct/rank
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_hot_rank_em() 获取人气榜...")
+            df = ak.stock_hot_rank_em()
+            if df is None or df.empty:
+                logger.warning("[Akshare] 人气榜返回空数据")
+                return None
+
+            result = []
+            for _, row in df.head(n).iterrows():
+                result.append({
+                    'rank': int(row.get('当前排名', 0)),
+                    'code': str(row.get('代码', '')),
+                    'name': str(row.get('股票名称', '')),
+                    'price': float(row.get('最新价', 0) or 0),
+                    'change_pct': float(row.get('涨跌幅', 0) or 0),
+                })
+            logger.info(f"[Akshare] 人气榜获取成功: {len(result)} 条")
+            return result
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取人气榜失败: {e}")
+            return None
+
+    def get_limit_up_pool(self, date: Optional[str] = None) -> Optional[pd.DataFrame]:
+        """
+        获取涨停板池（当日涨停股票列表）
+
+        数据源：ak.stock_zt_pool_em()
+        注意：收盘后数据更准确，盘中可能不完整。
+
+        Args:
+            date: 日期，格式 'YYYYMMDD'，默认最近交易日
+
+        Returns:
+            DataFrame: 包含代码/名称/涨停时间/封板资金/连板天数等
+        """
+        import akshare as ak
+
+        if date is None:
+            date = datetime.now().strftime('%Y%m%d')
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info(f"[API调用] ak.stock_zt_pool_em(date={date}) 获取涨停板池...")
+            df = ak.stock_zt_pool_em(date=date)
+            if df is not None and not df.empty:
+                logger.info(f"[Akshare] 涨停板池获取成功: {len(df)} 只股票")
+                rename_map = {
+                    '代码': 'code', '名称': 'name', '涨停价': 'limit_up_price',
+                    '涨跌幅': 'change_pct', '成交额': 'amount',
+                    '流通市值': 'circ_mv', '总市值': 'total_mv',
+                    '换手率': 'turnover_rate', '连板数': 'consecutive_days',
+                    '首次封板时间': 'first_seal_time', '最后封板时间': 'last_seal_time',
+                    '炸板次数': 'break_count', '封单金额': 'seal_amount',
+                    '所属行业': 'industry',
+                }
+                for old_col, new_col in rename_map.items():
+                    if old_col in df.columns:
+                        df = df.rename(columns={old_col: new_col})
+                return df
+            else:
+                logger.warning(f"[Akshare] 涨停板池 {date} 返回空数据")
+                return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取涨停板池失败 ({date}): {e}")
+            return None
+
+    def get_concept_fund_flow_rank(self, indicator: str = "今日") -> Optional[pd.DataFrame]:
+        """
+        获取概念板块资金流向排名
+
+        数据源：ak.stock_sector_fund_flow_rank(indicator, sector_type)
+
+        Args:
+            indicator: 时间周期 "今日" / "5日" / "10日"
+
+        Returns:
+            DataFrame: 概念板块资金流向排名数据
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info(f"[API调用] ak.stock_sector_fund_flow_rank(indicator={indicator}, sector_type=概念资金流)...")
+            df = ak.stock_sector_fund_flow_rank(indicator=indicator, sector_type="概念资金流")
+            if df is not None and not df.empty:
+                logger.info(f"[Akshare] 概念板块资金流获取成功: {len(df)} 条")
+                return df
+            else:
+                logger.warning("[Akshare] 概念板块资金流返回空数据")
+                return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取概念板块资金流失败: {e}")
+            return None
+
+    def get_industry_fund_flow_rank(self, indicator: str = "今日") -> Optional[pd.DataFrame]:
+        """
+        获取行业板块资金流向排名
+
+        数据源：ak.stock_sector_fund_flow_rank(indicator, sector_type)
+
+        Args:
+            indicator: 时间周期 "今日" / "5日" / "10日"
+
+        Returns:
+            DataFrame: 行业板块资金流向排名数据
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info(f"[API调用] ak.stock_sector_fund_flow_rank(indicator={indicator}, sector_type=行业资金流)...")
+            df = ak.stock_sector_fund_flow_rank(indicator=indicator, sector_type="行业资金流")
+            if df is not None and not df.empty:
+                logger.info(f"[Akshare] 行业板块资金流获取成功: {len(df)} 条")
+                return df
+            else:
+                logger.warning("[Akshare] 行业板块资金流返回空数据")
+                return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取行业板块资金流失败: {e}")
+            return None
+
+    def get_north_flow(self) -> Optional[Dict[str, Any]]:
+        """
+        获取北向资金最近一个交易日净流入
+
+        数据源：ak.stock_hsgt_hist_em(symbol="北向资金")
+
+        Returns:
+            Dict: 包含 date/net_inflow/accumulated 等信息
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_hsgt_hist_em(symbol=北向资金) 获取北向资金...")
+            df = ak.stock_hsgt_hist_em(symbol="北向资金")
+            if df is None or df.empty:
+                logger.warning("[Akshare] 北向资金返回空数据")
+                return None
+
+            latest = df.iloc[-1]
+            net_inflow_raw = latest.get('当日成交净买额', 0)
+            try:
+                net_inflow = float(net_inflow_raw) if net_inflow_raw else 0.0
+            except (TypeError, ValueError):
+                net_inflow = 0.0
+
+            accumulated_raw = latest.get('历史累计净买额', 0)
+            try:
+                accumulated = float(accumulated_raw) if accumulated_raw else 0.0
+            except (TypeError, ValueError):
+                accumulated = 0.0
+
+            result = {
+                'date': str(latest.get('日期', '')),
+                'net_inflow_yi': round(net_inflow, 2),
+                'accumulated_yi': round(accumulated, 2),
+                'direction': 'inflow' if net_inflow > 0 else 'outflow' if net_inflow < 0 else 'flat',
+            }
+            logger.info(f"[Akshare] 北向资金: {result['date']} 净流入 {result['net_inflow_yi']}亿")
+            return result
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取北向资金失败: {e}")
+            return None
+
+    def get_board_change(self) -> Optional[pd.DataFrame]:
+        """
+        获取板块异动详情（盘中异动板块）
+
+        数据源：ak.stock_board_change_em()
+
+        Returns:
+            DataFrame: 板块异动数据
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_board_change_em() 获取板块异动...")
+            df = ak.stock_board_change_em()
+            if df is not None and not df.empty:
+                logger.info(f"[Akshare] 板块异动获取成功: {len(df)} 条")
+                return df
+            else:
+                logger.warning("[Akshare] 板块异动返回空数据")
+                return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取板块异动失败: {e}")
+            return None
+
+    def get_market_profit_effect(self) -> Optional[Dict[str, Any]]:
+        """
+        获取全市场赚钱效应指标
+
+        数据源：ak.stock_market_profit_em()
+
+        Returns:
+            Dict: 赚钱效应相关指标
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_market_profit_em() 获取赚钱效应...")
+            df = ak.stock_market_profit_em()
+            if df is None or df.empty:
+                logger.warning("[Akshare] 赚钱效应返回空数据")
+                return None
+
+            # 返回最新一行数据
+            latest = df.iloc[-1] if len(df) > 1 else df.iloc[0]
+            result = {}
+            for col in df.columns:
+                val = latest.get(col)
+                try:
+                    result[str(col)] = float(val) if val is not None else None
+                except (TypeError, ValueError):
+                    result[str(col)] = str(val) if val is not None else None
+            logger.info(f"[Akshare] 赚钱效应获取成功")
+            return result
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取赚钱效应失败: {e}")
             return None
 
 

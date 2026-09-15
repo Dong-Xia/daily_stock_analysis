@@ -27,6 +27,8 @@ class HistoryItem(BaseModel):
         description="情绪评分（历史数据可能超出 0-100 范围，读取时不做约束）",
     )
     operation_advice: Optional[str] = Field(None, description="操作建议")
+    heat_label: Optional[str] = Field(None, description="热度标签（热门/活跃/中性/冷门）")
+    trend_status: Optional[str] = Field(None, description="趋势确认状态")
     created_at: Optional[str] = Field(None, description="创建时间")
     
     class Config:
@@ -158,6 +160,61 @@ class ReportDetails(BaseModel):
     sector_rankings: Optional[Any] = Field(None, description="板块涨跌榜（结构 {top, bottom}）")
 
 
+class HeatLabel(BaseModel):
+    """热度标签"""
+    label: str = ""
+    label_en: str = ""
+    turnover_desc: str = ""
+    momentum_desc: str = ""
+
+
+class CycleStructure(BaseModel):
+    """三周期结构"""
+    long_term: str = ""
+    medium_term: str = ""
+    short_term: str = ""
+    alignment: str = ""
+
+
+class TrendConfirmation(BaseModel):
+    """趋势确认"""
+    status: str = ""
+    status_en: str = ""
+    signal_strength: str = ""
+    bias_warning: str = ""
+
+
+class CycleResonance(BaseModel):
+    """多周期共振信号"""
+    weekly_trend: str = ""
+    daily_structure: str = ""
+    hourly_signal: str = ""
+    resonance_level: str = ""
+    resonance_score: Optional[int] = None
+    resonance_summary: str = ""
+
+class BuyQualityFactor(BaseModel):
+    """买点质量因子"""
+    name: str = ""
+    status: str = ""
+    detail: str = ""
+
+class BuyQuality(BaseModel):
+    """买点质量评分"""
+    quality_score: Optional[int] = None
+    quality_summary: str = ""
+    quality_factors: List[BuyQualityFactor] = Field(default_factory=list)
+
+
+class TradingAnnotations(BaseModel):
+    """交易原则注解"""
+    cycle_structure: Optional[CycleStructure] = Field(None, description="三周期结构")
+    trend_confirmation: Optional[TrendConfirmation] = Field(None, description="趋势确认")
+    heat_label: Optional[HeatLabel] = Field(None, description="热度标签")
+    cycle_resonance: Optional[CycleResonance] = Field(None, description="多周期共振信号(LLM)")
+    buy_quality: Optional[BuyQuality] = Field(None, description="买点质量评分(LLM)")
+
+
 class AnalysisReport(BaseModel):
     """完整分析报告"""
 
@@ -165,6 +222,7 @@ class AnalysisReport(BaseModel):
     summary: ReportSummary = Field(..., description="概览区")
     strategy: Optional[ReportStrategy] = Field(None, description="策略点位区")
     details: Optional[ReportDetails] = Field(None, description="详情区")
+    tradingAnnotations: Optional[TradingAnnotations] = Field(None, description="交易原则注解")
 
     class Config:
         json_schema_extra = {

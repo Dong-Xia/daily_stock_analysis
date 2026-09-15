@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { BarChart3, BriefcaseBusiness, Home, LogOut, MessageSquareQuote, Settings2 } from 'lucide-react';
+import { Activity, BarChart3, BookHeart, BriefcaseBusiness, ClipboardCheck, Flame, Home, LogOut, MessageSquareQuote, Settings2, Swords, Target, Workflow } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useAgentChatStore } from '../../stores/agentChatStore';
@@ -27,6 +27,13 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'home', label: '首页', to: '/', icon: Home, exact: true },
   { key: 'chat', label: '问股', to: '/chat', icon: MessageSquareQuote, badge: 'completion' },
   { key: 'portfolio', label: '持仓', to: '/portfolio', icon: BriefcaseBusiness },
+  { key: 'chipHealth', label: '筹码体检', to: '/chip-health', icon: Activity },
+  { key: 'sectors', label: '热点', to: '/sectors', icon: Flame },
+  { key: 'stockPick', label: '选股', to: '/stock-pick', icon: Target },
+  { key: 'signalPipeline', label: '信号链', to: '/signal-pipeline', icon: Workflow },
+  { key: 'tactic', label: '战法', to: '/tactic', icon: Swords },
+  { key: 'xinfa', label: '心法', to: '/xinfa', icon: BookHeart },
+  { key: 'marketReview', label: '复盘', to: '/market-review', icon: ClipboardCheck },
   { key: 'backtest', label: '回测', to: '/backtest', icon: BarChart3 },
   { key: 'settings', label: '设置', to: '/settings', icon: Settings2 },
 ];

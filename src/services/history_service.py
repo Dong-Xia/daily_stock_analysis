@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 
 from src.config import get_config, resolve_news_window_days
+from src.services.market_money_status import assess_market_money_status, format_money_status_block
 from src.report_language import (
     get_bias_status_emoji,
     get_localized_stock_name,
@@ -34,6 +35,40 @@ if TYPE_CHECKING:
     from src.analyzer import AnalysisResult
 
 logger = logging.getLogger(__name__)
+
+# 资金水位模块级缓存（同进程内只创建一次 DataFetcherManager）
+_MONEY_STATUS_CACHE: dict = {}
+_MONEY_STATUS_FETCHER = None
+
+
+def _get_money_status_block(language: str = "zh") -> str:
+    """Get formatted money status block with per-trading-day caching.
+
+    缓存键含有效交易日：同一交易日只取数一次；跨交易日自动刷新并清理旧键，
+    避免长驻进程永远返回首请求的过期快照。
+    """
+    global _MONEY_STATUS_FETCHER
+    if _MONEY_STATUS_FETCHER is None:
+        from data_provider import DataFetcherManager
+        _MONEY_STATUS_FETCHER = DataFetcherManager()
+    try:
+        from src.core.trading_calendar import get_effective_trading_date
+        eff_date = get_effective_trading_date("cn").isoformat()
+    except Exception:
+        eff_date = date.today().isoformat()
+    prefix = f"money_status_{language}_"
+    cache_key = f"{prefix}{eff_date}"
+    if cache_key not in _MONEY_STATUS_CACHE:
+        for stale_key in [k for k in _MONEY_STATUS_CACHE if k.startswith(prefix) and k != cache_key]:
+            _MONEY_STATUS_CACHE.pop(stale_key, None)
+        try:
+            status = assess_market_money_status(_MONEY_STATUS_FETCHER)
+            block = format_money_status_block(status, language=language)
+            _MONEY_STATUS_CACHE[cache_key] = block
+        except Exception as e:
+            logger.debug("资金水位获取失败（fail-open）: %s", e)
+            _MONEY_STATUS_CACHE[cache_key] = ""
+    return _MONEY_STATUS_CACHE[cache_key]
 
 
 class MarkdownReportGenerationError(Exception):
@@ -114,6 +149,21 @@ class HistoryService:
             # Convert to response format
             items = []
             for record in records:
+                heat_label = None
+                trend_status = None
+                try:
+                    raw = parse_json_field(record.raw_result)
+                    if isinstance(raw, dict):
+                        ms = raw.get("market_snapshot", {}) or {}
+                        if isinstance(ms, dict):
+                            ann = ms.get("trading_annotations", {}) or {}
+                            hl = ann.get("heat_label", {}) or {}
+                            tc = ann.get("trend_confirmation", {}) or {}
+                            heat_label = hl.get("label") or None
+                            trend_status = tc.get("status") or None
+                except Exception:
+                    pass
+
                 items.append({
                     "id": record.id,
                     "query_id": record.query_id,
@@ -122,6 +172,8 @@ class HistoryService:
                     "report_type": record.report_type,
                     "sentiment_score": record.sentiment_score,
                     "operation_advice": record.operation_advice,
+                    "heat_label": heat_label,
+                    "trend_status": trend_status,
                     "created_at": record.created_at.isoformat() if record.created_at else None,
                 })
             
@@ -597,8 +649,13 @@ class HistoryService:
         signal_text, signal_emoji, signal_tag = self._get_signal_level(result)
         dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
 
-        report_lines = [
-            f"# 📊 {name_escaped} ({result.code}) {labels['report_title']}",
+        # P5: 资金水位块（市场全局，模块级缓存，fail-open）
+        money_block = _get_money_status_block(report_language)
+
+        report_lines = [f"# 📊 {name_escaped} ({result.code}) {labels['report_title']}"]
+        if money_block:
+            report_lines += ["", money_block, "", "---"]
+        report_lines += [
             "",
             f"> {analysis_date_label}: **{report_date}** | {report_time_label}: {report_time}",
             "",
@@ -667,6 +724,40 @@ class HistoryService:
 
         # ========== 行情快照 ==========
         self._append_market_snapshot_to_report(report_lines, result, labels)
+
+        # ========== 交易原则注解（P4/P1/P2）==========
+        snapshot = getattr(result, 'market_snapshot', None) or {}
+        annotations = snapshot.get('trading_annotations', {}) or {}
+        if annotations:
+            ann_lines = []
+            tc = annotations.get('trend_confirmation', {}) or {}
+            if tc.get('status'):
+                bw = tc.get('bias_warning', '')
+                bw_text = f"（{bw}）" if bw else ""
+                ann_lines.append(f"**{labels.get('ann_trend_status_label', '趋势确认')}**: {tc['status']}{bw_text}")
+            cs = annotations.get('cycle_structure', {}) or {}
+            if cs.get('alignment'):
+                ae = {"all_bullish": "🟢", "all_bearish": "🔴", "long_med_bullish_short_diverge": "🟡",
+                       "long_bullish_med_diverge": "🟠", "bearish_with_short_rebound": "🟡", "mixed": "⚪"}
+                emoji = ae.get(cs['alignment'], "⚪")
+                ann_lines.append(
+                    f"**{labels.get('ann_cycle_label', '三周期结构')}**: "
+                    f"长线{cs.get('long_term', '?')}｜中线{cs.get('medium_term', '?')}｜短线{cs.get('short_term', '?')} {emoji}"
+                )
+            hl = annotations.get('heat_label', {}) or {}
+            if hl.get('label'):
+                he = {"热门": "🔥", "活跃": "⚡", "中性": "➖", "冷门": "❄️",
+                       "Hot": "🔥", "Active": "⚡", "Neutral": "➖", "Cold": "❄️"}
+                hemoji = he.get(hl['label'], "➖")
+                ann_lines.append(
+                    f"**{labels.get('ann_heat_label', '热度')}**: {hemoji} {hl['label']}　"
+                    f"{hl.get('turnover_desc', '')}　{hl.get('momentum_desc', '')}"
+                )
+            if ann_lines:
+                report_lines.append(f"### 📋 {labels.get('ann_heading', '交易原则')}")
+                report_lines.append("")
+                report_lines.extend(ann_lines)
+                report_lines.append("")
 
         # ========== 数据透视 ==========
         data_persp = dashboard.get('data_perspective', {}) if dashboard else {}

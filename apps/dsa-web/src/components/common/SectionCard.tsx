@@ -2,7 +2,7 @@ import type React from 'react';
 import { Card } from './Card';
 
 interface SectionCardProps {
-  title: string;
+  title: React.ReactNode;
   subtitle?: string;
   actions?: React.ReactNode;
   children: React.ReactNode;

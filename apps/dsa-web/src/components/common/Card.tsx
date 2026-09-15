@@ -10,6 +10,7 @@ interface CardProps {
   variant?: 'default' | 'bordered' | 'gradient';
   hoverable?: boolean;
   padding?: 'none' | 'sm' | 'md' | 'lg';
+  onClick?: () => void;
 }
 
 /**
@@ -24,6 +25,7 @@ export const Card: React.FC<CardProps> = ({
   variant = 'default',
   hoverable = false,
   padding = 'md',
+  onClick,
 }) => {
   const paddingStyles = {
     none: '',
@@ -60,6 +62,7 @@ export const Card: React.FC<CardProps> = ({
     <div
       style={style}
       className={cn('rounded-2xl', variantStyles[variant], hoverStyles, paddingStyles[padding], className)}
+      onClick={onClick}
     >
       {(title || subtitle) && (
         <div className="mb-3">

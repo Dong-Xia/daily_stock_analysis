@@ -36,9 +36,14 @@ from src.services.system_config_service import SystemConfigService
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
-    """Initialize and release shared services for the app lifecycle."""
     app.state.system_config_service = SystemConfigService()
     try:
+        from src.services.sector_warmup_service import run_sector_cache_warmup
+        run_sector_cache_warmup(delay_seconds=10)
+
+        from src.services.sector_analysis_scheduler import start_sector_scheduler
+        start_sector_scheduler()
+
         yield
     finally:
         if hasattr(app.state, "system_config_service"):

@@ -48,6 +48,9 @@ const REPORT_TEXT = {
     leadingBoard: '领涨',
     laggingBoard: '领跌',
     neutralBoard: '中性',
+    tradingPrinciples: '交易原则',
+    heat: '热度',
+    cycleStructure: '周期结构',
   },
   en: {
     keyInsights: 'KEY INSIGHTS',
@@ -93,6 +96,9 @@ const REPORT_TEXT = {
     leadingBoard: 'Leading',
     laggingBoard: 'Lagging',
     neutralBoard: 'Neutral',
+    tradingPrinciples: 'Trading Principles',
+    heat: 'Heat',
+    cycleStructure: 'Cycle Structure',
   },
 } as const;
 

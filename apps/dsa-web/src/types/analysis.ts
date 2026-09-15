@@ -92,12 +92,64 @@ export interface ReportDetails {
   sectorRankings?: SectorRankings;
 }
 
+/** Trading principle annotations */
+export interface HeatLabel {
+  label: string;
+  labelEn: string;
+  turnoverDesc: string;
+  momentumDesc: string;
+}
+
+export interface CycleStructure {
+  longTerm: string;
+  mediumTerm: string;
+  shortTerm: string;
+  alignment: string;
+}
+
+export interface CycleResonance {
+  weeklyTrend: string;
+  dailyStructure: string;
+  hourlySignal: string;
+  resonanceLevel: string;
+  resonanceScore?: number;
+  resonanceSummary: string;
+}
+
+export interface BuyQualityFactor {
+  name: string;
+  status: string;
+  detail: string;
+}
+
+export interface BuyQuality {
+  qualityScore?: number;
+  qualitySummary: string;
+  qualityFactors: BuyQualityFactor[];
+}
+
+export interface TrendConfirmation {
+  status: string;
+  statusEn: string;
+  signalStrength: string;
+  biasWarning: string;
+}
+
+export interface TradingAnnotations {
+  cycleStructure?: CycleStructure;
+  cycleResonance?: CycleResonance;
+  buyQuality?: BuyQuality;
+  trendConfirmation?: TrendConfirmation;
+  heatLabel?: HeatLabel;
+}
+
 /** Full analysis report */
 export interface AnalysisReport {
   meta: ReportMeta;
   summary: ReportSummary;
   strategy?: ReportStrategy;
   details?: ReportDetails;
+  tradingAnnotations?: TradingAnnotations;
 }
 
 // ============ Analysis Result Types ============
@@ -197,6 +249,8 @@ export interface HistoryItem {
   reportType?: string;
   sentimentScore?: number;
   operationAdvice?: string;
+  heatLabel?: string;  // 热度标签 (热门/活跃/中性/冷门)
+  trendStatus?: string;  // 趋势确认状态
   createdAt: string;
 }
 

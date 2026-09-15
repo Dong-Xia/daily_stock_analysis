@@ -17,6 +17,7 @@
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -863,20 +864,21 @@ class DataFetcherManager:
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
         from .longbridge_fetcher import LongbridgeFetcher
-        # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
+        from .em_hidden_fetcher import EmHiddenApiFetcher
         efinance = EfinanceFetcher()
+        em_hidden = EmHiddenApiFetcher()
         akshare = AkshareFetcher()
-        tushare = TushareFetcher()  # 会根据 Token 配置自动调整优先级
-        pytdx = PytdxFetcher()      # 通达信数据源（可配 PYTDX_HOST/PYTDX_PORT）
+        tushare = TushareFetcher()
+        pytdx = PytdxFetcher()
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
-        longbridge = LongbridgeFetcher()  # 长桥（美股/港股兜底，懒加载）
+        longbridge = LongbridgeFetcher()
 
-        # 初始化数据源列表
         self._ensure_concurrency_guards()
         with self._fetchers_lock:
             self._fetchers = [
                 efinance,
+                em_hidden,
                 akshare,
                 tushare,
                 pytdx,
@@ -1376,6 +1378,37 @@ class DataFetcherManager:
     def _supplement_from_longbridge(self, stock_code: str, primary_quote):
         """Shortcut kept for backward-compat with A-share general loop."""
         return self._supplement_quote(stock_code, primary_quote, "LongbridgeFetcher")
+
+    def get_all_a_stock_realtime(self) -> list:
+        """获取全A股实时行情批量数据（通过 AkShareFetcher 缓存机制）。
+
+        Returns:
+            列表，每项为 dict: {code, name, price, change_pct, turnover_rate, volume, ...}
+            失败时返回空列表。
+        """
+        from .realtime_types import safe_float
+
+        try:
+            for fetcher in self._get_fetchers_snapshot():
+                if fetcher.name == "AkshareFetcher" and hasattr(fetcher, "get_a_stock_realtime_batch"):
+                    df = fetcher.get_a_stock_realtime_batch()
+                    if df is not None and not df.empty:
+                        result = []
+                        for _, row in df.iterrows():
+                            result.append({
+                                "code": str(row.get("代码", "")),
+                                "name": str(row.get("名称", "")),
+                                "price": safe_float(row.get("最新价")) or 0.0,
+                                "change_pct": safe_float(row.get("涨跌幅")) or 0.0,
+                                "turnover_rate": safe_float(row.get("换手率")) or 0.0,
+                                "volume": safe_float(row.get("成交量")) or 0.0,
+                                "amount": safe_float(row.get("成交额")) or 0.0,
+                            })
+                        logger.info("[DataFetcherManager] 全A股批量行情: %d 条", len(result))
+                        return result
+        except Exception as e:
+            logger.warning("[DataFetcherManager] 全A股批量行情获取失败: %s", e)
+        return []
 
     def get_chip_distribution(self, stock_code: str):
         """
@@ -2491,10 +2524,84 @@ class DataFetcherManager:
             return [], [], source_chain, last_error
 
     def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
-        """获取板块涨跌榜（自动切换数据源）"""
-        # 按需求固定回退顺序：Akshare(EM) -> Akshare(Sina) -> Tushare -> Efinance
+        try:
+            from src.services.sector_cache_service import get_sector_cache
+            cache = get_sector_cache()
+            cached = cache.get_sector_rankings()
+            if cached is not None:
+                age_hours = cache.get_sector_rankings_age_hours()
+                if age_hours is not None and age_hours > 6:
+                    logger.debug("[板块排行] 缓存超过6小时，跳过缓存强制刷新")
+                    raise ValueError("stale_cache")
+                top, bottom = cached
+                logger.debug(f"[板块排行] 缓存命中: top={len(top)}, bottom={len(bottom)}")
+                return top[:n], bottom[:n]
+        except Exception as e:
+            logger.debug(f"[板块排行] 读取缓存失败: {e}")
+
         top, bottom, _, last_error = self._get_sector_rankings_with_meta(n)
         if top or bottom:
+            try:
+                cache.set_sector_rankings(top, bottom)
+            except Exception as ce:
+                logger.debug(f"[板块排行] 写入缓存失败: {ce}")
             return top, bottom
         logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")
         return [], []
+
+    def get_board_members(self, board_name: str, board_type: str = "industry") -> List[Dict[str, Any]]:
+        """获取板块成分股列表（缓存优先 -> 数据源回退 -> 写入缓存）。"""
+        try:
+            from src.services.sector_cache_service import get_sector_cache
+            cache = get_sector_cache()
+            cached = cache.get_board_members(board_name, board_type, accept_stale=True)
+            if cached is not None:
+                return cached
+        except Exception as e:
+            logger.debug(f"[板块成分股] 读取缓存失败: {e}")
+
+        fetchers = self._get_fetchers_snapshot()
+
+        # AkshareFetcher 有新浪 fallback，在当前东财被封的情况下是唯一可用路径，
+        # 优先尝试并给予更长超时（20s），避免被前面失败的 fetcher 阻塞。
+        akshare_fetcher = None
+        other_fetchers = []
+        for fetcher in fetchers:
+            if not hasattr(fetcher, "get_board_members"):
+                continue
+            if fetcher.name == "AkshareFetcher":
+                akshare_fetcher = fetcher
+            else:
+                other_fetchers.append(fetcher)
+
+        ordered_fetchers = ([akshare_fetcher] if akshare_fetcher else []) + other_fetchers
+
+        for fetcher in ordered_fetchers:
+            timeout = 20.0 if fetcher.name == "AkshareFetcher" else 6.0
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        self._call_fetcher_method,
+                        fetcher,
+                        "get_board_members",
+                        board_name=board_name,
+                        board_type=board_type,
+                    )
+                    df = future.result(timeout=timeout)
+                if df is not None and not df.empty:
+                    records = df.to_dict("records")
+                    logger.info(f"[{fetcher.name}] 板块 {board_name} 成分股获取成功: {len(records)} 只")
+                    try:
+                        cache.set_board_members(board_name, board_type, records)
+                    except Exception as ce:
+                        logger.debug(f"[板块成分股] 写入缓存失败: {ce}")
+                    return records
+            except FutureTimeoutError:
+                logger.warning(f"[{fetcher.name}] 获取板块 {board_name} 成分股超时 ({timeout:.0f}s)")
+                continue
+            except Exception as e:
+                error_type, error_reason = summarize_exception(e)
+                logger.warning(f"[{fetcher.name}] 获取板块 {board_name} 成分股失败: {error_reason}")
+                continue
+        logger.warning(f"[板块成分股] 所有数据源均未能获取 {board_name} 成分股")
+        return []

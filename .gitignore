@@ -78,3 +78,10 @@ verify_*.py
 static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
+
+# local tool artifacts
+.gstack/
+.playwright-mcp/
+
+# stray root npm lock (real one lives in apps/dsa-web/)
+/package-lock.json

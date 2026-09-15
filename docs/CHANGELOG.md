@@ -12,7 +12,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 
-- [修复] 大盘复盘链路接入 `REPORT_LANGUAGE`：`REPORT_LANGUAGE=en` 时，A 股/合并复盘的 Prompt、章节标题、模板兜底文案与通知包装标题统一改为英文，避免出现英文正文外包中文标题的问题。
+- [新功能] 调仓信号引擎 (RebalanceEngine): RS排名+去弱留强+龙头轮换+6种信号类型
+- [新功能] CLI `--rebalance C:P:S,...`: 调仓分析
+- [新功能] 三层止损管理系统 (StopLossManager): ATR/MA/结构锚点硬止损+移动止损+时间止损+批量评估
+- [新功能] CLI `--stop-loss CODE:ENTRY:PRICE:METHOD`: 止损评估
+- [新功能] API `POST /api/v1/stocks/stop-loss`: 止损检查 HTTP 接口
+- [新功能] 动态仓位计算器 (PositionSizer): Kelly公式+风控+市场阶段+板块约束的多层仓位引擎
+- [新功能] CLI `--position-size CODE:ENTRY:STOP:EQUITY`: 仓位计算
+- [新功能] API `POST /api/v1/stocks/position-size`: 仓位计算 HTTP 接口
+- [新功能] 板块轮动跟踪器 (SectorRotationTracker): 多日排行榜持续性分析，自动分类主线/轮动/脉冲/退潮板块
+- [新功能] CLI `--sector-rotation`: 板块轮动分析
+- [新功能] API `GET /api/v1/stocks/sector-rotation`: 板块轮动 HTTP 接口
+- [新功能] 市场状态分类器 (MarketRegimeClassifier): 基于指数MA趋势/量能/宽度/波动率/情绪的7阶段量化分类，含仓位建议
+- [新功能] 板块选股服务 (StockScreenerService): 4层漏斗筛选（流动性→趋势→排名→评分），支持 CLI `--screen` 和 API `/stocks/screen`
+- [新功能] CLI `--screen <板块名称>`: 快速执行板块选股并打印结果
+- [新功能] API `POST /api/v1/stocks/screen`: 板块选股 HTTP 接口
+- [文档] 热点板块设计思想总结: docs/hot-sectors-philosophy.md
+- [新功能] 基本面选股器 (FundamentalScreener): 基于AkShare财报的全市场多条件筛选（营收/利润增长+净利润门槛）
+- [新功能] CLI `--fundamental [YYYYMMDD]`: 基本面选股
+- [文档] 选股设计思想总结: docs/stock-pick-philosophy.md`REPORT_LANGUAGE=en` 时，A 股/合并复盘的 Prompt、章节标题、模板兜底文案与通知包装标题统一改为英文，避免出现英文正文外包中文标题的问题。
 - [修复] `EfinanceFetcher.get_main_indices()` 对东方财富指数实时行情的开盘价映射改为兼容 `今开 -> 开盘 -> open`，修复部分 `efinance` 版本下指数开盘价被读成缺失值的问题（fixes #1043）
 - [修复] `AGENT_MAX_STEPS` 在 orchestrator 多 Agent 模式下统一明确为“默认作为各子 Agent 的步数上限而非硬覆盖；TechnicalAgent 等高默认值 Agent 会被封顶、低默认值 Agent 保持原值；当用户主动调高（>10）时，再统一覆盖所有子 Agent 采用全局值”，同时修复用户设置 12 但 TechnicalAgent 仍以默认 6 步运行并报 "Agent exceeded max steps" 的问题（fixes #1026）
 - [修复] Specialist（Skill）Agent 失败不再中断整个分析管线，改为与 intel/risk 相同的优雅降级策略
@@ -27,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充飞书 Webhook 配置说明：强调 `FEISHU_WEBHOOK_URL` 是群通知必填项、`FEISHU_WEBHOOK_SECRET` 与飞书机器人「签名校验」必须两端同时启用或同时关闭、`FEISHU_APP_SECRET` 仅用于应用/Stream Bot 模式不可替代 Webhook；同步完善英文指南并在 `.env.example` 为相关配置项补充内联说明注释
 - [修复] 桌面端版本展示改为统一读取 `apps/dsa-desktop/package.json`：移除 preload 中硬编码的 `0.1.0`，并在设置页展示真实桌面端版本，避免开发态与打包态长期显示错误版本号。
 
+- [新功能] 心法模块 (Xinfa): 新增炒股心得记录功能，支持 Markdown 正文 / 分类 / 标签 / 关联股票 / 情绪评分 / 标星；含 CRUD API 和 CLI `--xinfa` 命令
+- [新功能] 热点板块模块新增手动输入 Markdown 复盘数据功能，支持解析并可视化展示（新增 `POST /api/v1/sectors/parse-manual` 接口）
+- [新功能] 大盘复盘增强热点自动分析：新增概念板块排行、人气榜、涨停板池、板块资金流、北向资金等多维数据源 (AKShare)，结构化摘要 + 自动注入 LLM 复盘 Prompt
+- [改进] 手动输入板块复盘升级为结构化可视化仪表盘：新增市场情绪面板（指数/涨跌分布/资金流向）、TOP5 板块 leaderboard（含催化逻辑）、涨停热力图（recharts 横向柱状图）、连板梯队纵向可视化、龙头带动效应卡片（含联动标的标签与效应总结）
 - [新功能] 集成 Longbridge OpenAPI 作为美股/港股可选数据源；配置 `LONGBRIDGE_*` 后优先使用长桥获取日线与实时行情，YFinance / AkShare 兜底；未配置时行为与此前一致。长桥联调请使用 `tests/longbridge_live_smoke.py`（手动脚本，不参与 pytest 收集）。
 - [文档] 澄清 README（中/英/繁）中长桥「首选 / 兜底 / 未配置不调用」的边界；`docs/README_EN.md` / `docs/README_CHT.md` 顶部导航与完整指南链接改为 `./` 相对路径，避免在文档子目录下解析错误；`LONGBRIDGE_PRINT_QUOTE_PACKAGES` 与代码及 `.env.example` 对齐为未设置时默认关闭。
 - [修复] 港股名称获取失败问题 — 修复当主数据源字段缺失时无法正确回退到备用字段获取港股名称的问题（fixes #940）
@@ -47,6 +69,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] GitHub Actions `daily_analysis.yml` 未注入 `REPORT_LANGUAGE` 环境变量，导致用户在 Secrets/Variables 中配置后不生效（fixes #1013）
 - [修复] `GET /api/v1/analysis/status/{task_id}` 从数据库回填已完成任务时缺少 `current_price` / `change_pct`，导致首页报告股票名旁不显示实时价格（fixes #983）
 - [修复] 修复非交易日（周末/节假日）筹码分布与板块排行返回倒数第二个交易日数据的问题现在正常返回最近交易日数据（fix #1009）
+- [新功能] 持仓筹码体检：WebUI 新增 `/chip-health` 页面（持仓清单编辑保存 + 一键体检），基于本地 stockData 三年日线重建筹码分布，按底部筹码 3/5/7 日逐日流失规则输出 🔴/🟠/🟡/⚪/🟢 减仓判定，详见 docs/chip_health.md
+- [新功能] API `/api/v1/chip-health`（GET/PUT holdings、POST run、GET status），配置项 `CHIP_STOCK_DATA_DIR`（数据目录，默认 /Users/zhangze/stockData）与 `CHIP_HEALTH_TIMEOUT`（体检子进程超时秒数，默认 600）
+- [修复] 筹码体检 status 的缓存更新时间显示为 UTC（差8小时易误判数据过期），改为本地时区
+- [新功能] 信号链「明日买入」标的就地筹码体检：日线信号链结果中出现 `今日回踩完成→明日买入` 时，`/signal-pipeline` 页显示候选横幅与「开始体检」按钮，一键复用 `POST /api/v1/chip-health/run`（临时清单，不覆盖已保存持仓）对这批票跑筹码引擎，抽屉内以买入语义（🔴放弃/🟠谨慎/🟢双确认）展示诱多/派发排查结果
+- [修复] 板块缓存服务 `SectorCacheService` 每次查询泄漏一个 SQLite 连接（连接对象退出 `with` 块不会自动 close），改为上下文管理器统一提交并关闭，同时补齐 WAL/synchronous PRAGMA，消除长驻服务下的 fd 耗尽风险
+- [修复] 信号链 API 数据目录改为读取 `SIGNAL_STOCK_DATA_DIR`（默认值不变，本机行为零变化），Docker/服务器部署可用环境变量指向实际目录；同步 `.env.example`
+- [修复] 英文大盘复盘丢失"热点板块统计表"：section 提取正则无法匹配新 Prompt 标题 `Sector / Concept Highlights`，导致统计表注入静默跳过
+- [修复] 报告"资金水位"模块级缓存改为按有效交易日缓存并清理旧键，修复长驻服务跨天仍返回首请求盘前快照的问题
+- [修复] 动态仓位计算 `PositionSizer`：单票上限裁剪后未同步比例，板块上限检查使用修剪前旧值导致重复裁剪/错误改写仓位
+- [修复] 热点板块分析接入爬虫涨停池连板数（`analyze(scraper_limit_up_pool=...)` 参数此前声明但从未生效，且富化方法存在赋值缺失与无调用点问题），梯队/龙头现直接复用当日涨停池数据
+- [改进] 热点板块分析与三连阳筛选的逐股串行 K 线拉取改为线程池批量并行（沿用 `StockScreenerService` 范式），并给 `analyze()` 增加 120s 时间预算、板块精选单板块预算降为 40s，避免 `/sectors/hot` 实时回退与筛选接口被服务端超时腰斩
+- [修复] 信号链进度默认步数 6→5（与实际流水线脚本 total_steps=5 对齐）
+- [修复] Web 前端请求竞态：复盘报告/热点选股各 store 的异步加载补上请求序号守卫（快速切换日期/板块时旧响应不再覆盖新结果），信号链轮询改用 ref 读取最新时段与日期，修复完成回调以过期参数加载结果的问题
+- [测试] 新增 sector_cache 连接关闭、资金水位跨日刷新、英文 section 正则源码级守卫、PositionSizer 双重裁剪回归、marketReviewStore 竞态等测试
+- [新功能] 信号链日线新增"二次放量确认→明日买入"状态（起量破SA→缩量回梯→再放量→次日量能持续），回放口径见 docs/superpowers/specs/2026-09-15-ladder-buy-rules-design.md
+- [改进] "今日回踩完成→明日买入"升级为两日温和放量收阳且收盘收复下轨的严格口径（dsa_signal/ladder_rules.py，全市场回放 T+5 胜率+2.7pp）
+- [新功能] 明日买入横幅/筹码体检入口同时覆盖两类"明日买入"状态
+- [修复] 信号链资金流"当日主力占比%"列误用东财 f62（收盘价）字段导致恒等于收盘价，改为 f57（主力净占比）并加 ±100 越界防护；历史缓存脏占比已一次性清空，随每日抓取自动重建
+- [新功能] 基本面选股输出上限支持 `FUNDAMENTAL_MAX_CANDIDATES`（默认 50=原行为，1-500），CLI `--fundamental` 与 API `/stocks/fundamental` 生效；澄清 `.env.example` 中 `SCREENER_MAX_CANDIDATES` 仅作用于板块选股
+- [修复] 基本面选股终端输出误读问题：`全部条件通过` 原显示评分截断后的候选数（恒为 50），现显示真实通过数并单独提示截断；不再把首名候选的实际增速打印成">阈值"文案
 
 ## [3.12.0] - 2026-04-01
 

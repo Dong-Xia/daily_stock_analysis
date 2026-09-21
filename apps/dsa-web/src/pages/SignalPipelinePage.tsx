@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Activity, Calendar, CheckCircle2, Download, Loader2, Play, XCircle } from 'lucide-react';
-import { Card, Button, Badge, EmptyState, Drawer } from '../components/common';
+import { Activity, Calendar, CheckCircle2, Download, Info, Loader2, Play, XCircle } from 'lucide-react';
+import { Card, Button, Badge, EmptyState, Drawer, Tooltip } from '../components/common';
 import { cn } from '../utils/cn';
 import {
   signalPipelineApi,
@@ -174,7 +174,52 @@ export default function SignalPipelinePage() {
       {/* 标题 */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-bold text-foreground">信号链筛选</h1>
+          <h1 className="inline-flex items-center gap-1.5 text-xl font-bold text-foreground">
+            信号链筛选
+            <Tooltip
+              contentClassName="max-w-[26rem]"
+              side="bottom"
+              content={
+                <div className="space-y-2">
+                  <p className="font-medium">信号链筛选策略</p>
+                  <p>收盘后全市场按 MRMC 通道（蓝色梯子）+ DX 系战法信号独立筛选，日线 / 5 / 15 / 30 分钟四段并行；所有跟踪均从战法信号日起算。</p>
+                  <div className="space-y-3">
+                    <div>
+                      <span className="font-medium">核心指标：</span>
+                      <div className="text-xs space-y-1.5 pl-3 mt-1">
+                        <p><strong>蓝色梯子</strong> — 上边缘 <span className="text-cyan">SA</span>（EMA-high-24）与下边缘 <span className="text-cyan">SB</span>（EMA-low-23）构成通道，跟踪主力资金的进出足迹</p>
+                        <p><strong>DX/DXX/DXDX 信号</strong> — MRMC 战法触发点，一切状态跟踪的起点；信号后 <span className="text-cyan">≤5 个交易日</span>收盘突破 SA 才进入活跃轨道，否则作废</p>
+                      </div>
+                    </div>
+                    <div className="border-t border-border/20 pt-2">
+                      <span className="font-medium">两条买入规则（日线，2026-09 定稿）：</span>
+                      <div className="text-xs space-y-1.5 pl-3 mt-1">
+                        <p><strong>① 回踩完成 → 明日买入</strong> — 突破后缩量回踩下轨（量 ≤ 突破日 <span className="text-cyan">72%</span>、最低触及 SB）→ <span className="text-cyan">连续两日</span>温和放量（1.1–2.5×MA5 量）收阳且收盘收复 SB，两日中至少一天贴轨</p>
+                        <p><strong>② 二次放量确认 → 明日买入</strong> — 起量突破（≥<span className="text-cyan">1.5×</span>MA5 量）→ 缩量回梯内（≤60% 且收盘 &lt; SA）→ 二次起量（≥1.2×收阳过前收）→ <span className="text-cyan">次日量能持续</span>（≥80% 且不破前日最低）</p>
+                        <p><strong>失效线</strong> — 跟踪期收盘跌破 <span className="text-cyan">SB×0.97</span>（深度破位）立即作废；两规则同日满足时 ① 优先</p>
+                      </div>
+                    </div>
+                    <div className="border-t border-border/20 pt-2">
+                      <span className="font-medium">结果增强列：</span>
+                      <div className="text-xs space-y-1.5 pl-3 mt-1">
+                        <p><span className="text-cyan font-medium">主力资金流</span> — 东财个股 5 日累计/当日净流入与净占比、所属板块资金方向，用于验证量价信号的资金成色</p>
+                        <p><span className="text-cyan font-medium">520 金叉</span> — MA5/MA20 多空关系与金叉后天数，作为趋势侧交叉确认</p>
+                      </div>
+                    </div>
+                    <div className="border-t border-border/20 pt-2">
+                      <p className="text-[11px] text-secondary-text leading-relaxed">
+                        <strong>核心理念</strong>：缩量回踩下轨被接住是"深洗盘买点"，回调后二次放量是"二波进攻买点"。口径经过三年全市场回放收紧（历史胜率显著优于单日触轨即买的旧版），信号少而精——多数交易日没有买点是设计使然，中间态（回踩中/等二次起量）即明日候选前瞻清单。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              }
+            >
+              <span className="inline-flex h-5 w-5 cursor-help items-center justify-center rounded-full border border-border/60 text-xs font-bold text-cyan hover:border-cyan hover:bg-cyan/10 hover:text-cyan">
+                <Info className="h-3.5 w-3.5" />
+              </span>
+            </Tooltip>
+          </h1>
           <p className="mt-1 text-sm text-secondary-text">
             多时段 MRMC 信号链独立筛选 — 日线 / 5分钟 / 15分钟 / 30分钟
           </p>

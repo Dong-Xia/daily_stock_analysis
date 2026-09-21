@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Play, Plus, Save, Trash2 } from 'lucide-react';
-import { Card, Button, EmptyState } from '../components/common';
+import { Info, Play, Plus, Save, Trash2 } from 'lucide-react';
+import { Card, Button, EmptyState, Tooltip } from '../components/common';
 import { cn } from '../utils/cn';
 import {
   chipHealthApi,
@@ -99,7 +99,51 @@ export default function ChipHealthPage() {
     <div className="mx-auto max-w-6xl space-y-4 p-4 lg:p-6">
       {/* 标题 */}
       <div>
-        <h1 className="text-xl font-bold text-foreground">持仓筹码体检</h1>
+        <h1 className="inline-flex items-center gap-1.5 text-xl font-bold text-foreground">
+          持仓筹码体检
+          <Tooltip
+            contentClassName="max-w-[26rem]"
+            side="bottom"
+            content={
+              <div className="space-y-2">
+                <p className="font-medium">筹码体检策略</p>
+                <p>用本地 3 年日线重建筹码分布，聚焦<strong>底部筹码的多日连续流失</strong>——底部筹码是主力压舱石，主力真走货它一定先漏。判定规则经 2023–2026 历史回测验证。</p>
+                <div className="space-y-3">
+                  <div>
+                    <span className="font-medium">五档灯语（信号后 3 日下跌概率为回测值）：</span>
+                    <div className="text-xs space-y-1.5 pl-3 mt-1">
+                      <p><span className="text-cyan">🔴</span> <strong>底筹连降 7 日且累计流失 &gt;18%</strong> — 61.0%，主力派发，减仓</p>
+                      <p><span className="text-cyan">🟠</span> <strong>连降 5 日且累计流失 &gt;15%</strong> — 60.6%，高危，减仓</p>
+                      <p><span className="text-cyan">🟡</span> <strong>连降 3 日且累计流失 &gt;8%</strong> — 58.4%，先警示</p>
+                      <p><span className="text-cyan">⚪</span> <strong>3 日流失 &gt;8% 但非逐日</strong>（骤减又回补）— 量化做 T 假象，随后均值 <span className="text-cyan">+0.89%</span>，勿卖</p>
+                      <p><span className="text-cyan">🟢</span> <strong>底筹稳定或增加</strong> — 继续持有</p>
+                    </div>
+                  </div>
+                  <div className="border-t border-border/20 pt-2">
+                    <span className="font-medium">算法与细节：</span>
+                    <div className="text-xs space-y-1.5 pl-3 mt-1">
+                      <p>通达信式三角分布 + 换手率日级衰减；"连降 N 日"即口诀<strong>"单日筹码不要信，连看两三辨真假"</strong>的量化版</p>
+                      <p>获利比例 &gt;90% 额外标记高位风险 ⚠️；成交量单位按每票历史量级自动校正</p>
+                    </div>
+                  </div>
+                  <div className="border-t border-border/20 pt-2">
+                    <span className="font-medium">买入前体检（信号链联动）：</span>
+                    <p className="text-xs pl-3 mt-1">对"明日买入"候选票用同一引擎反向排查诱多/派发：🟢 技术+筹码双确认 · ⚪ 正常买 · 🟡 轻仓观察 · 🟠 诱多风险谨慎 · 🔴 放弃买入</p>
+                  </div>
+                  <div className="border-t border-border/20 pt-2">
+                    <p className="text-[11px] text-secondary-text leading-relaxed">
+                      <strong>定位与局限</strong>：该体系价值在<strong>避雷/砍尾部</strong>而非高胜率择时；股本以最新总市值近似（小流通盘次新股换手会高估）；结果仅供参考，不构成投资建议。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            }
+          >
+            <span className="inline-flex h-5 w-5 cursor-help items-center justify-center rounded-full border border-border/60 text-xs font-bold text-cyan hover:border-cyan hover:bg-cyan/10 hover:text-cyan">
+              <Info className="h-3.5 w-3.5" />
+            </span>
+          </Tooltip>
+        </h1>
         <p className="mt-1 text-sm text-secondary-text">
           基于本地3年日线的筹码引擎 — 底部筹码多日流失检测（🔴连降7日&gt;18% / 🟠5日&gt;15% / 🟡3日&gt;8%），
           ⚪为量化做T假象（勿卖）。规则依据2023-2026回测，仅供参考不构成投资建议。

@@ -409,7 +409,9 @@ class TripleVolumeScreener:
 
     @staticmethod
     def _passes_all(c: TripleVolumeCandidate) -> bool:
-        return c.score >= 3
+        # "三倍量"是本战法的核心必要条件：预筛选已保证 pass_change/pass_turnover
+        # 恒真（起步 2 分），若仅按 score>=3 判定，量能未达标的股票也会入选。
+        return c.pass_volume and c.score >= 3
 
 
 def _safe_float(val: Any) -> float:

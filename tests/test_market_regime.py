@@ -268,6 +268,27 @@ def _make_synthetic_df(length: int = 100, start_price: float = 3000.0) -> pd.Dat
     })
 
 
+def _wire_index_data_mocks(mock_manager, dfs: Dict[str, pd.DataFrame]):
+    """让 get_daily_data（元组返回）与 get_index_daily_data（单 df 返回）都从 dfs 取数。
+
+    market_regime 对上证 000001 走 get_index_daily_data（指数专用入口，规避与平安
+    银行 000001.SZ 的代码歧义），其余指数走 get_daily_data；测试需同时 mock 两者，
+    否则 MagicMock 默认返回会让 000001 被误判为"数据不足"而静默丢弃。
+    """
+    def _daily(code, **kwargs):
+        if code in dfs:
+            return dfs[code], "mock"
+        raise ValueError(f"Unknown code: {code}")
+
+    def _index(code, **kwargs):
+        if code in dfs:
+            return dfs[code]
+        raise ValueError(f"Unknown code: {code}")
+
+    mock_manager.get_daily_data.side_effect = _daily
+    mock_manager.get_index_daily_data.side_effect = _index
+
+
 class TestMarketRegimeIntegration:
     """Integration tests with synthetic data and mocked data_manager."""
 
@@ -307,13 +328,7 @@ class TestMarketRegimeIntegration:
     def test_classify_returns_regime_result(self, mock_manager):
         """classify() returns a RegimeResult with the correct type."""
         dfs = self._make_dfs(bullish=True)
-
-        def side_effect(code, **kwargs):
-            if code in dfs:
-                return dfs[code], "mock_source"
-            raise ValueError(f"Unknown code: {code}")
-
-        mock_manager.get_daily_data.side_effect = side_effect
+        _wire_index_data_mocks(mock_manager, dfs)
 
         classifier = MarketRegimeClassifier(data_manager=mock_manager)
         result = classifier.classify(indices=["000001", "399001", "399006"], date="2026-05-06")
@@ -328,9 +343,7 @@ class TestMarketRegimeIntegration:
     def test_classify_bullish_market(self, mock_manager):
         """In a bullish scenario, regime should be bullish."""
         dfs = self._make_dfs(bullish=True)
-        mock_manager.get_daily_data.side_effect = (
-            lambda code, **kwargs: (dfs.get(code, pd.DataFrame()), "mock")
-        )
+        _wire_index_data_mocks(mock_manager, dfs)
 
         classifier = MarketRegimeClassifier(data_manager=mock_manager)
         result = classifier.classify(date="2026-05-06")
@@ -344,9 +357,7 @@ class TestMarketRegimeIntegration:
     def test_classify_bearish_market(self, mock_manager):
         """In a bearish scenario, regime should be bearish."""
         dfs = self._make_dfs(bullish=False)
-        mock_manager.get_daily_data.side_effect = (
-            lambda code, **kwargs: (dfs.get(code, pd.DataFrame()), "mock")
-        )
+        _wire_index_data_mocks(mock_manager, dfs)
 
         classifier = MarketRegimeClassifier(data_manager=mock_manager)
         result = classifier.classify(date="2026-05-06")
@@ -361,6 +372,8 @@ class TestMarketRegimeIntegration:
         """When no data is available, default RANGE_BOUND is returned."""
         mock_manager = MagicMock()
         mock_manager.get_daily_data.side_effect = ValueError("No data")
+        # 上证 000001 走指数专用入口，需一并 mock 其失败
+        mock_manager.get_index_daily_data.side_effect = ValueError("No data")
 
         classifier = MarketRegimeClassifier(data_manager=mock_manager)
         result = classifier.classify(indices=["000001"], date="2026-05-06")
@@ -371,9 +384,7 @@ class TestMarketRegimeIntegration:
     def test_classify_with_market_stats_breadth(self, mock_manager):
         """When market stats are available, breadth uses adv/decl ratio."""
         dfs = self._make_dfs(bullish=True)
-        mock_manager.get_daily_data.side_effect = (
-            lambda code, **kwargs: (dfs.get(code, pd.DataFrame()), "mock")
-        )
+        _wire_index_data_mocks(mock_manager, dfs)
 
         # Mock fetcher that returns market stats
         mock_fetcher = MagicMock()
@@ -398,19 +409,65 @@ class TestMarketRegimeIntegration:
     def test_classify_default_indices(self, mock_manager):
         """Default indices (上证/深证/创业板) are used when none provided."""
         dfs = self._make_dfs(bullish=True)
-        calls = {}
+        daily_calls: Dict[str, int] = {}
+        index_calls: Dict[str, int] = {}
 
-        def side_effect(code, **kwargs):
-            calls[code] = calls.get(code, 0) + 1
+        def _daily(code, **kwargs):
+            daily_calls[code] = daily_calls.get(code, 0) + 1
             if code in dfs:
                 return dfs[code], "mock"
             raise ValueError(f"Unknown code: {code}")
 
-        mock_manager.get_daily_data.side_effect = side_effect
+        def _index(code, **kwargs):
+            index_calls[code] = index_calls.get(code, 0) + 1
+            if code in dfs:
+                return dfs[code]
+            raise ValueError(f"Unknown code: {code}")
+
+        mock_manager.get_daily_data.side_effect = _daily
+        mock_manager.get_index_daily_data.side_effect = _index
 
         classifier = MarketRegimeClassifier(data_manager=mock_manager)
         classifier.classify(date="2026-05-06")
 
-        # Default codes should have been fetched
-        for default_code in ("000001", "399001", "399006"):
-            assert default_code in calls, f"Expected {default_code} to be fetched"
+        # 上证 000001 必须走指数专用入口（规避平安银行歧义），不走 get_daily_data
+        assert "000001" in index_calls, "上证 000001 应通过 get_index_daily_data 获取"
+        assert "000001" not in daily_calls, "上证 000001 不应再通过 get_daily_data 获取（会解析成平安银行）"
+        # 深证成指/创业板指仍走 get_daily_data
+        for default_code in ("399001", "399006"):
+            assert default_code in daily_calls, f"Expected {default_code} to be fetched via get_daily_data"
+
+
+# ====================================================================
+#  回归守卫：上证 000001 不得经由 get_daily_data（会被解析成平安银行）
+# ====================================================================
+
+
+def test_sse_index_not_fetched_via_get_daily_data():
+    """回归：_fetch_index_data 对 000001 必须走 get_index_daily_data。
+
+    历史 bug：get_daily_data("000001") 在 A 股各数据源被解析为平安银行(000001.SZ)，
+    市场状态分类因此把单只银行股当成上证综指。若有人改回 get_daily_data 处理 000001，
+    本测试的 stub 会抛 AssertionError 使其失败。
+    """
+    sse_df = _make_synthetic_df(length=120, start_price=3100.0)
+
+    class _StubManager:
+        def get_daily_data(self, code, **kwargs):
+            if str(code) == "000001":
+                raise AssertionError("上证 000001 不应走 get_daily_data（会解析成平安银行）")
+            raise ValueError(f"Unexpected get_daily_data code: {code}")
+
+        def get_index_daily_data(self, code, **kwargs):
+            assert str(code) == "000001"
+            return sse_df
+
+        def _get_fetchers_snapshot(self):
+            return []
+
+    classifier = MarketRegimeClassifier(data_manager=_StubManager())
+    dfs = classifier._fetch_index_data(["000001"], date="2026-05-06")
+
+    assert "000001" in dfs
+    # 取到的是指数点位（~3000+），而非平安银行股价（~11 元）
+    assert float(dfs["000001"]["close"].iloc[-1]) > 1000

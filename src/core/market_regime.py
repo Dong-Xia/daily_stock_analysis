@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from data_provider.base import DataFetcherManager
+from data_provider.base import DataFetcherManager, normalize_stock_code
 from src.schemas.stock_screener_schema import (
     DimensionEvidence,
     MarketRegime,
@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 
 # 默认指数代码：上证综指 / 深证成指 / 创业板指
 _DEFAULT_INDICES = ["000001", "399001", "399006"]
+
+# 上证综指代码为 000001，但与平安银行(000001.SZ)代码空间冲突：
+# get_daily_data("000001") 会按个股优先解析，返回平安银行而非上证指数。
+# 故上证指数需走 get_index_daily_data（指数专用入口）。
+# 深证成指(399001)/创业板指(399006)在 399xxx 指数区间，不与个股冲突，可继续用 get_daily_data。
+_SSE_INDEX_CODE = "000001"
 
 # 维度默认权重
 _DEFAULT_DIMENSION_WEIGHTS: Dict[str, float] = {
@@ -184,7 +190,11 @@ class MarketRegimeClassifier:
         dfs: Dict[str, pd.DataFrame] = {}
         for code in indices:
             try:
-                df, _ = self.data_manager.get_daily_data(code, end_date=date, days=120)
+                if normalize_stock_code(code) == _SSE_INDEX_CODE:
+                    # 上证综指与平安银行代码冲突，走指数专用入口
+                    df = self.data_manager.get_index_daily_data(code, end_date=date, days=120)
+                else:
+                    df, _ = self.data_manager.get_daily_data(code, end_date=date, days=120)
                 if df is not None and not df.empty and len(df) >= 20:
                     dfs[code] = df
                 else:

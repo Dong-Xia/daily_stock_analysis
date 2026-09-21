@@ -1037,7 +1037,97 @@ class DataFetcherManager:
         elapsed = time.time() - request_start
         logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
         raise DataFetchError(error_summary)
-    
+
+    def get_index_daily_data(
+        self,
+        index_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30,
+    ) -> Optional[pd.DataFrame]:
+        """获取 A 股指数日线历史数据（上证/深证/创业板等），标准化为通用列名。
+
+        为什么需要独立入口：A 股指数代码与个股代码空间重叠——例如 '000001'
+        既是上证指数又是平安银行(000001.SZ)，get_daily_data 会优先按个股解析，
+        返回平安银行而非指数。本方法直接走 akshare 指数接口，规避该歧义。
+
+        数据源：东财 index_zh_a_hist（含涨跌幅，优先）→ 新浪 stock_zh_index_daily（兜底）。
+
+        Args:
+            index_code: 指数代码，如 '000001'(上证综指)/'399001'(深证成指)/'399006'(创业板指)
+            start_date: 开始日期 'YYYY-MM-DD'（可选）
+            end_date: 结束日期 'YYYY-MM-DD'（可选，默认今天）
+            days: 获取日历天数（start_date 未指定时倒推，口径与 get_daily_data 一致）
+
+        Returns:
+            标准化 DataFrame（date/open/high/low/close/volume/amount/pct_chg，按日期升序），
+            所有数据源失败或数据不足时返回 None。
+        """
+        from datetime import timedelta
+
+        import akshare as ak
+
+        code = normalize_stock_code(index_code)
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if start_date is None:
+            start_dt = datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=days * 2)
+            start_date = start_dt.strftime('%Y-%m-%d')
+
+        # 路径1：东财指数日线（含 open/high/low/close/volume/amount/pct_chg）
+        try:
+            raw = ak.index_zh_a_hist(
+                symbol=code, period="daily",
+                start_date=start_date.replace('-', ''), end_date=end_date.replace('-', ''),
+            )
+            if raw is not None and not raw.empty and "收盘" in raw.columns:
+                df = self._normalize_index_df(raw.rename(columns={
+                    "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
+                    "最低": "low", "成交量": "volume", "成交额": "amount", "涨跌幅": "pct_chg",
+                }))
+                if df is not None and not df.empty:
+                    logger.info("[指数日线] %s 东财获取成功: rows=%d", code, len(df))
+                    return df
+        except Exception as e:
+            logger.debug("[指数日线] %s 东财接口失败: %s", code, e)
+
+        # 路径2：新浪指数日线兜底（无 pct_chg，用 close 环比计算）
+        try:
+            sina_symbol = f"sz{code}" if code.startswith("399") else f"sh{code}"
+            raw = ak.stock_zh_index_daily(symbol=sina_symbol)
+            if raw is not None and not raw.empty and "close" in raw.columns:
+                raw = raw.copy()
+                raw["date"] = pd.to_datetime(raw["date"])
+                mask = (raw["date"] >= pd.to_datetime(start_date)) & (raw["date"] <= pd.to_datetime(end_date))
+                raw = raw.loc[mask]
+                raw["pct_chg"] = (raw["close"].pct_change() * 100).fillna(0)
+                df = self._normalize_index_df(raw)
+                if df is not None and not df.empty:
+                    logger.info("[指数日线] %s 新浪获取成功: rows=%d", code, len(df))
+                    return df
+        except Exception as e:
+            logger.debug("[指数日线] %s 新浪接口失败: %s", code, e)
+
+        logger.warning("[指数日线] %s 所有数据源均失败", code)
+        return None
+
+    @staticmethod
+    def _normalize_index_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """把指数原始数据规整为标准列名/类型，按日期升序，剔除 close 为空的行。"""
+        keep = [c for c in STANDARD_COLUMNS if c in df.columns]
+        if "close" not in keep:
+            return None
+        df = df[keep].copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for col in keep:
+            if col != "date":
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["close"])
+        if "date" in df.columns:
+            df = df.sort_values("date")
+        return df.reset_index(drop=True) if not df.empty else None
+
     @property
     def available_fetchers(self) -> List[str]:
         """返回可用数据源名称列表"""

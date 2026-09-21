@@ -127,6 +127,20 @@ class OversoldBounceScreener:
             elapsed_seconds=round(elapsed, 1),
         )
 
+    def _fetch_index_closes(self) -> Optional[np.ndarray]:
+        """获取上证指数近期日线收盘价（升序）。
+
+        通过 DataFetcherManager.get_index_daily_data 取数——不能用
+        get_daily_data("000001")，A股各数据源会把 000001 解析为平安银行（深市个股）。
+        """
+        try:
+            df = self.data_manager.get_index_daily_data("000001", days=10)
+            if df is not None and not df.empty and "close" in df.columns and len(df) >= 5:
+                return df["close"].values
+        except Exception as e:
+            logger.debug("[超跌反弹] 上证指数日线获取失败: %s", e)
+        return None
+
     def _check_market_panic(self) -> bool:
         """检查大盘是否处于恐慌状态
 
@@ -136,11 +150,11 @@ class OversoldBounceScreener:
         3. 指数远离5日线（乖离率<-2%）
         """
         try:
-            df, _ = self.data_manager.get_daily_data("000001", days=10)
-            if df is None or df.empty or len(df) < 5:
+            close = self._fetch_index_closes()
+            if close is None or len(close) < 5:
+                logger.info("[超跌反弹] 上证指数日线数据不足，跳过恐慌检查")
                 return False
 
-            close = df["close"].values
             ma5 = np.mean(close[-5:])
 
             # 检查连续下跌天数
@@ -167,7 +181,7 @@ class OversoldBounceScreener:
                 "[超跌反弹] 大盘恐慌检查: 连跌%d天, 当日%.2f%%, 5日线乖离%.2f%%, 恐慌=%s",
                 consecutive_down, today_change, bias_pct, is_panic,
             )
-            return is_panic
+            return bool(is_panic)
 
         except Exception as e:
             logger.warning("[超跌反弹] 大盘恐慌检查失败: %s", e)

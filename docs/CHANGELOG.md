@@ -94,6 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 三倍量战法细筛 `_passes_all` 原仅判 `score>=3`，而预筛选已保证涨幅/换手两项恒真（起步 2 分），量能未达 3 倍的股票也会入选；现将"三倍量"设为核心必要条件
 - [新功能] `DataFetcherManager.get_index_daily_data()`：A 股指数日线历史数据专用入口（东财 `index_zh_a_hist` 优先、新浪 `stock_zh_index_daily` 兜底），规避指数代码与个股代码空间重叠的歧义（如 `000001` 同时是上证指数与平安银行）；超跌反弹战法与大盘状态分类器共用，消除平行实现
 - [修复] 大盘状态分类器（MarketRegimeClassifier）同源 bug：`_fetch_index_data` 对上证综指（000001）经 `get_daily_data` 取到的是平安银行个股数据，导致市场阶段按单只银行股误判；现将上证指数路由至 `get_index_daily_data`（实测取回 ≈3900 点），深证成指/创业板指（399xxx，不与个股冲突）保持原路径
+- [新功能] capital_forensics(资金筹码取证)策略技能: 量化主导判别+主力周期定位+收派计分卡+监管痕迹一票否决
+- [文档] 资金筹码取证方法论规约: docs/capital-forensics-philosophy.md
 
 ## [3.12.0] - 2026-04-01
 

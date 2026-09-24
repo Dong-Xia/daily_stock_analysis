@@ -15,13 +15,17 @@ Fundamental Screener - 基本面选股服务
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# 全市场三标准通过名单缓存 TTL: 财报数据低频变化, TTL 内同季度只拉一次
+_PASS_MAP_CACHE_TTL_SECONDS = 6 * 3600
 
 
 @dataclass
@@ -62,6 +66,10 @@ class FundamentalScreener:
     过滤出满足营收增长、利润增长等条件的候选股票。
     """
 
+    # 全市场三标准通过名单缓存: {quarter_date: (time.monotonic(), pass_map)}
+    # 财报数据低频变化, TTL 内同季度只拉一次; 调用方不得修改返回的 dict
+    _PASS_MAP_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
+
     def __init__(
         self,
         min_revenue_yoy: float = 20.0,
@@ -78,6 +86,78 @@ class FundamentalScreener:
         self._data_manager = data_manager
         self._board_scraper = board_scraper
 
+    def _fetch_quarter_df(self, quarter_date: str) -> pd.DataFrame:
+        """拉取季度财报并预处理(数值化 + 三条 pass 布尔列 + 评分列)。
+
+        失败时抛异常,由调用方决定降级方式。
+        """
+        import akshare as ak
+
+        df = ak.stock_yjbb_em(date=quarter_date)
+        if df is None or df.empty:
+            raise ValueError("无数据")
+
+        df = df.dropna(subset=["净利润-同比增长", "营业总收入-同比增长"], how="all")
+        revenue_col = "营业总收入-同比增长"
+        profit_col = "净利润-同比增长"
+        net_profit_col = "净利润-净利润"
+
+        df[revenue_col] = pd.to_numeric(df.get(revenue_col, pd.Series([0])), errors="coerce").fillna(0)
+        df[profit_col] = pd.to_numeric(df.get(profit_col, pd.Series([0])), errors="coerce").fillna(0)
+        df[net_profit_col] = pd.to_numeric(df.get(net_profit_col, pd.Series([0])), errors="coerce").fillna(0)
+
+        df["_pass_revenue"] = df[revenue_col] >= self.min_revenue_yoy
+        df["_pass_profit"] = df[profit_col] >= self.min_profit_yoy
+        df["_pass_net_profit"] = df[net_profit_col] >= self.min_net_profit_yi * 1e8
+
+        df["_score"] = 0
+        df["_score"] += df[revenue_col].apply(
+            lambda x: 3 if x >= 50 else (2 if x >= 30 else 1)
+        )
+        df["_score"] += df[profit_col].apply(
+            lambda x: 5 if x >= 100 else (3 if x >= 70 else 1)
+        )
+        df["_score"] += df[net_profit_col].apply(
+            lambda x: 2 if x >= 5e8 else 1
+        )
+        return df
+
+    def get_pass_map(self, quarter_date: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        """返回全市场通过三条硬性标准的股票 {代码: 基本面字段}(不截断, 带 TTL 缓存)。
+
+        供信号链交集等调用方使用; 失败时异常向上抛, 由调用方决定降级方式。
+
+        注意: 缓存键仅含季度、通过标准按构造阈值计算, 跨实例共享缓存
+        假定使用默认阈值(当前所有调用方仅覆盖 max_candidates, 不影响通过名单)。
+        """
+        if quarter_date is None:
+            quarter_date = self._resolve_latest_quarter()
+
+        now = time.monotonic()
+        cached = FundamentalScreener._PASS_MAP_CACHE.get(quarter_date)
+        if cached and now - cached[0] < _PASS_MAP_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        df = self._fetch_quarter_df(quarter_date)
+        mask = df["_pass_revenue"] & df["_pass_profit"] & df["_pass_net_profit"]
+
+        pass_map: Dict[str, Dict[str, Any]] = {}
+        for _, row in df[mask].iterrows():
+            code = str(row.get("股票代码", "")).strip()
+            if not code:
+                continue
+            pass_map[code] = {
+                "name": str(row.get("股票简称", "")).strip(),
+                "revenue_yoy": float(row.get("营业总收入-同比增长", 0) or 0),
+                "profit_yoy": float(row.get("净利润-同比增长", 0) or 0),
+                "net_profit": float(row.get("净利润-净利润", 0) or 0),
+                "industry": str(row.get("所处行业", "")).strip(),
+                "composite_score": float(row.get("_score", 0) or 0),
+            }
+
+        FundamentalScreener._PASS_MAP_CACHE[quarter_date] = (now, pass_map)
+        return pass_map
+
     def screen(self, quarter_date: Optional[str] = None) -> FundamentalResult:
         """执行基本面筛选。
 
@@ -88,44 +168,25 @@ class FundamentalScreener:
         Returns:
             FundamentalResult 筛选结果
         """
-        import akshare as ak
-
         if quarter_date is None:
             quarter_date = self._resolve_latest_quarter()
             logger.info("[基本面] 自动选择季度: %s", quarter_date)
 
-        # Fetch all stocks' financial data
         try:
-            df = ak.stock_yjbb_em(date=quarter_date)
+            df = self._fetch_quarter_df(quarter_date)
         except Exception as e:
             logger.error("[基本面] 获取财报数据失败: %s", e)
             return FundamentalResult(
                 date=quarter_date, errors=[f"数据获取失败: {e}"]
             )
 
-        if df is None or df.empty:
-            return FundamentalResult(
-                date=quarter_date, errors=["无数据"]
-            )
-
-        df = df.dropna(subset=["净利润-同比增长", "营业总收入-同比增长"], how="all")
-        total = len(df)
-
-        # Condition 1: 营收同比增长 > 20%
         revenue_col = "营业总收入-同比增长"
         profit_col = "净利润-同比增长"
         net_profit_col = "净利润-净利润"
         announce_col = "最新公告日期"
         industry_col = "所处行业"
 
-        df[revenue_col] = pd.to_numeric(df.get(revenue_col, pd.Series([0])), errors="coerce").fillna(0)
-        df[profit_col] = pd.to_numeric(df.get(profit_col, pd.Series([0])), errors="coerce").fillna(0)
-        df[net_profit_col] = pd.to_numeric(df.get(net_profit_col, pd.Series([0])), errors="coerce").fillna(0)
-
-        df["_pass_revenue"] = df[revenue_col] >= self.min_revenue_yoy
-        df["_pass_profit"] = df[profit_col] >= self.min_profit_yoy
-        df["_pass_net_profit"] = df[net_profit_col] >= self.min_net_profit_yi * 1e8
-
+        total = len(df)
         after_revenue = int(df["_pass_revenue"].sum())
         after_profit = int(df["_pass_profit"].sum())
 
@@ -133,18 +194,6 @@ class FundamentalScreener:
         mask = df["_pass_revenue"] & df["_pass_profit"] & df["_pass_net_profit"]
         candidates_df = df[mask].copy()
         after_net = len(candidates_df)
-
-        # Score: each condition met = +1, additional bonus for strength
-        candidates_df["_score"] = 0
-        candidates_df["_score"] += candidates_df[revenue_col].apply(
-            lambda x: 3 if x >= 50 else (2 if x >= 30 else 1)
-        )
-        candidates_df["_score"] += candidates_df[profit_col].apply(
-            lambda x: 5 if x >= 100 else (3 if x >= 70 else 1)
-        )
-        candidates_df["_score"] += candidates_df[net_profit_col].apply(
-            lambda x: 2 if x >= 5e8 else 1
-        )
 
         candidates_df = candidates_df.sort_values("_score", ascending=False)
         candidates_df = candidates_df.head(self.max_candidates)

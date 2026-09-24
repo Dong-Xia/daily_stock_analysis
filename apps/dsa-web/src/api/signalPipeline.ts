@@ -57,6 +57,16 @@ export interface SignalResults {
   rows: SignalRow[];
 }
 
+export interface FundamentalFilterResults {
+  date: string;
+  timeframe: string;
+  timeframe_label: string;
+  quarter: string;
+  total: number;
+  matched: number;
+  rows: SignalRow[];
+}
+
 export const signalPipelineApi = {
   async run(date: string): Promise<{ message: string; date: string }> {
     const response = await apiClient.post('/api/v1/signal-pipeline/run', { date });
@@ -84,6 +94,14 @@ export const signalPipelineApi = {
     });
     // 不用 toCamelCase — 中文 key 需要原样保留
     return response.data as SignalResults;
+  },
+
+  async fundamentalFilter(date: string, timeframe: string): Promise<FundamentalFilterResults> {
+    const response = await apiClient.get('/api/v1/signal-pipeline/fundamental-filter', {
+      params: { date, timeframe },
+    });
+    // 外层 key 与后端一致(rows 中文 key 原样), 同 results() 先例不做 camelCase 转换
+    return response.data as FundamentalFilterResults;
   },
 
   downloadUrl(date: string): string {

@@ -9,6 +9,7 @@ import {
   type PipelineStatus,
   type SignalResults,
   type SignalRow,
+  type FundamentalFilterResults,
 } from '../api/signalPipeline';
 import { chipHealthApi, type ChipHealthResult } from '../api/chipHealth';
 import { buyVerdict } from '../utils/buyVerdict';
@@ -63,6 +64,15 @@ export default function SignalPipelinePage() {
   const [buyError, setBuyError] = useState('');
   const [buyOpen, setBuyOpen] = useState(false);
 
+  // 基本面达标过滤(信号 × 基本面交集视图)
+  const [fundOn, setFundOn] = useState(false);
+  const [fundLoading, setFundLoading] = useState(false);
+  const [fundResults, setFundResults] = useState<FundamentalFilterResults | null>(null);
+  const [fundError, setFundError] = useState('');
+  const fundOnRef = useRef(false);
+  const loadFundFilterRef = useRef<(tf: string) => Promise<void>>(async () => {});
+  useEffect(() => { fundOnRef.current = fundOn; }, [fundOn]);
+
   // 轮询状态
   const startPolling = useCallback(() => {
     if (pollRef.current) clearInterval(pollRef.current);
@@ -90,6 +100,8 @@ export default function SignalPipelinePage() {
       setRunning(true);
       setStatus(null);
       setResults(null);
+      setFundResults(null);
+      setFundError('');
       await signalPipelineApi.run(date);
       startPolling();
     } catch (err: any) {
@@ -110,9 +122,13 @@ export default function SignalPipelinePage() {
   const loadResults = async (tf: string) => {
     setLoadingResults(true);
     clearBuy();
+    setFundResults(null);
+    setFundError('');
     try {
       const r = await signalPipelineApi.results(date, tf);
       setResults(r);
+      // 过滤视图开着时, 基础结果刷新后同步重拉交集
+      if (fundOnRef.current) loadFundFilterRef.current(tf);
     } catch {
       setResults(null);
     } finally {
@@ -121,6 +137,31 @@ export default function SignalPipelinePage() {
   };
 
   useEffect(() => { loadResultsRef.current = loadResults; });
+
+  // 基本面交集过滤结果加载
+  const loadFundFilter = useCallback(async (tf: string) => {
+    setFundLoading(true);
+    setFundError('');
+    try {
+      const r = await signalPipelineApi.fundamentalFilter(date, tf);
+      if (r.timeframe !== activeTabRef.current) return; // 丢弃过期 tab 的迟到响应
+      setFundResults(r);
+    } catch (err: unknown) {
+      setFundResults(null);
+      const raw = (err as { response?: { data?: { detail?: string } }; message?: string });
+      // 502 detail 已带后端"财报数据获取失败"前缀; 无响应错误(网络层)在此补前缀, 避免渲染时重复
+      setFundError(raw?.response?.data?.detail || (raw?.message ? `基本面数据获取失败: ${raw.message}` : '基本面数据获取失败'));
+    } finally {
+      setFundLoading(false);
+    }
+  }, [date]);
+  useEffect(() => { loadFundFilterRef.current = loadFundFilter; });
+
+  const handleFundToggle = () => {
+    const next = !fundOn;
+    setFundOn(next);
+    if (next && results) loadFundFilterRef.current(activeTab);
+  };
 
   // 切换 tab
   const handleTabChange = (tf: string) => {
@@ -165,6 +206,9 @@ export default function SignalPipelinePage() {
       setBuyRunning(false);
     }
   };
+
+  // 基本面过滤视图生效中(有结果且无错误); 失败/未加载时回退显示全部信号
+  const fundActive = fundOn && !!fundResults && !fundError;
 
   // 计算步骤状态
   const steps = getStepStates(status);
@@ -329,6 +373,34 @@ export default function SignalPipelinePage() {
         </Card>
       )}
 
+      {/* 基本面过滤控制条(有结果时才显示) */}
+      {results && results.count > 0 && (
+        <div className="flex flex-wrap items-center gap-3 px-1">
+          <label className="inline-flex cursor-pointer select-none items-center gap-2 text-sm font-medium text-foreground">
+            <input
+              type="checkbox"
+              checked={fundOn}
+              onChange={handleFundToggle}
+              className="h-4 w-4 accent-cyan"
+            />
+            仅看基本面达标
+          </label>
+          {fundLoading && (
+            <span className="inline-flex items-center gap-1 text-xs text-secondary-text">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> 财报数据加载中(首次约数秒)...
+            </span>
+          )}
+          {!fundLoading && fundActive && (
+            <span className="text-xs text-secondary-text">
+              财报季度 {fundResults!.quarter} · 营收≥20% / 净利润同比≥50% / 净利润≥0.5亿
+            </span>
+          )}
+          {fundError && (
+            <span className="text-xs text-danger">{fundError}, 已显示全部信号</span>
+          )}
+        </div>
+      )}
+
       {/* 结果表格 */}
       <Card padding="none">
         {loadingResults ? (
@@ -340,6 +412,11 @@ export default function SignalPipelinePage() {
           <EmptyState
             title="暂无数据"
             description={running ? '流水线运行中, 请等待完成后查看' : '点击"运行流水线"开始筛选'}
+          />
+        ) : fundActive && fundResults!.matched === 0 ? (
+          <EmptyState
+            title="无基本面达标标的"
+            description="当前时段信号股中没有同时满足基本面三标准的股票, 关闭开关查看全部信号"
           />
         ) : (
           <div className="overflow-x-auto">
@@ -358,11 +435,19 @@ export default function SignalPipelinePage() {
                     <th className="px-4 py-3 text-right text-xs font-medium text-secondary-text">主力占比%</th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-secondary-text">所属板块</th>
                     <th className="px-4 py-3 text-right text-xs font-medium text-secondary-text">板块主力</th>
+                    {fundActive && (
+                      <>
+                        <th className="px-4 py-3 text-right text-xs font-medium text-secondary-text">营收同比</th>
+                        <th className="px-4 py-3 text-right text-xs font-medium text-secondary-text">利润同比</th>
+                        <th className="px-4 py-3 text-right text-xs font-medium text-secondary-text">净利润(亿)</th>
+                        <th className="px-4 py-3 text-right text-xs font-medium text-secondary-text">基本面评分</th>
+                      </>
+                    )}
                 </tr>
               </thead>
               <tbody>
-                {results.rows.map((row, i) => (
-                  <SignalRow key={row['股票代码'] + i} row={row} />
+                {(fundActive ? fundResults!.rows : results.rows).map((row, i) => (
+                  <SignalRow key={row['股票代码'] + i} row={row} showFund={fundActive} />
                 ))}
               </tbody>
             </table>
@@ -370,7 +455,9 @@ export default function SignalPipelinePage() {
         )}
         {results && results.count > 0 && (
           <div className="border-t border-border/30 px-4 py-2 text-xs text-secondary-text">
-            共 {results.count} 只
+            {fundActive
+              ? `基本面达标 ${fundResults!.matched} / 信号总数 ${fundResults!.total}`
+              : `共 ${results.count} 只`}
           </div>
         )}
       </Card>
@@ -450,7 +537,7 @@ export default function SignalPipelinePage() {
 }
 
 // ── 行组件 ──
-function SignalRow({ row }: { row: SignalRow }) {
+function SignalRow({ row, showFund }: { row: SignalRow; showFund?: boolean }) {
   const statusColor = getStatusColor(row['信号状态']);
   const satisfy520 = row['满足520'] === 'True' || row['满足520'] === 'true';
 
@@ -494,6 +581,14 @@ function SignalRow({ row }: { row: SignalRow }) {
       <td className="px-4 py-2.5 text-right font-mono text-xs text-foreground">
         {row['板块主力净流入'] || ''}
       </td>
+      {showFund && (
+        <>
+          <td className="px-4 py-2.5 text-right font-mono text-xs text-foreground">{row['营收同比%'] || '—'}</td>
+          <td className="px-4 py-2.5 text-right font-mono text-xs text-foreground">{row['利润同比%'] || '—'}</td>
+          <td className="px-4 py-2.5 text-right font-mono text-xs text-foreground">{row['净利润(亿)'] || '—'}</td>
+          <td className="px-4 py-2.5 text-right font-mono text-xs text-foreground">{row['基本面评分'] || '—'}</td>
+        </>
+      )}
     </tr>
   );
 }

@@ -1,0 +1,1336 @@
+# B1 身份痕迹数据层(股东户数/两融/大宗)实现计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 为 `capital_forensics` 计分卡第 9/10/11 项接通真实数据:股东户数/两融余额/大宗交易作为 `fundamental_context` 三个新块(`holder_count`/`margin_balance`/`block_deals`)注入 LLM 分析 prompt,默认关闭、开启后增强。
+
+**Architecture:** 方案 A——`AkshareFundamentalAdapter` 新增抓取/提取方法(`_call_df_candidates` 候选探测,fail-open),`DataFetcherManager` 新增三个 context 块方法(照抄 `get_dragon_tiger_context` 模板)并接入 `get_fundamental_context`;两融/大宗接口为按日期的全市场表,故用**市场级 `(block, market, date)` 缓存**(条目不可变、免 TTL、仅容量淘汰,与 `_fundamental_cache` 同池)。
+
+**Tech Stack:** Python 3.11 / akshare 1.18.64(`stock_zh_a_gdhs`、`stock_zh_a_gdhs_detail_em`、`stock_margin_detail_sse/szse`、`stock_dzjy_mrmx`)/ pandas / unittest+pytest。
+
+**Spec:** `docs/superpowers/specs/2026-09-23-b1-identity-context-design.md`(含 2026-09-23 修订:独立预算三件套、signal_note 判定顺序 none→narrowing→deep_discount→premium→normal)
+
+**⚠️ 仓库硬规则:全程不执行 `git commit` / `git push` / `git tag`。所有任务无 commit 步骤,等用户明确确认。**
+
+**执行环境:** 命令在项目根 `/Users/zhangze/Desktop/工具安装包/app/stock/daily_stock_analysis` 下执行;Python 用 `/opt/homebrew/bin/python3.11`(环境无 `python` 命令)。
+
+**关键兼容决策(贯穿全程):** `data_provider/base.py` 中读取新配置一律用 `getattr(config, "enable_holder_count_context", False)` 形态——现有测试用 `SimpleNamespace` 构造 config(无新字段),裸 `config.xxx` 会让现有测试 AttributeError。adapter 侧不动 config。
+
+**已核实的关键锚点:**
+- `data_provider/fundamental_adapter.py`:`AkshareFundamentalAdapter._call_df_candidates(candidates) -> (df, source, errors)`(:267);`get_dragon_tiger_flag`(:473-530);模块级已有 `_safe_float`、`_normalize_code`、`_pick_by_keywords`
+- `data_provider/base.py`:`_build_fundamental_block(status, payload, source_chain, errors)`(:1925,静态,返回 `{"status","coverage","source_chain","errors","data"}`);`_run_with_retry(task, timeout, task_name) -> (result, err, cost_ms)`(:1841,attempts 取 `config.fundamental_retry_max`);`_normalize_source_chain(entries, provider, result, duration_ms)`(:1995 附近);`get_fundamental_context`(:2088,init dict ~2130、ETF 分支 ~2311、else 分支 boards 调用后 ~2342、`block_statuses` ~2345、尾部 for 元组 ~2355);`_should_cache_fundamental_context` 元组(:1975-1983);`_prune_fundamental_cache`(:645);`self._fundamental_cache`/`_fundamental_cache_lock`(:511-512);`self._fundamental_adapter` 实例属性;`_market_tag`/`_is_etf_code`/`normalize_stock_code` 模块级已有
+- `src/config.py`:dataclass 字段区(:673-717,fundamental 五件套在 :705-715);env 读取区(:1412 起);`parse_env_int`(:72)/`parse_env_float`(:117) 已存在
+- `src/core/config_registry.py`:`_FIELD_DEFINITIONS` dict,`ENABLE_CHIP_DISTRIBUTION` 条目(:405-417,display_order 23)
+- `.env.example`:`# FUNDAMENTAL_CACHE_MAX_ENTRIES=256`(:536 附近)
+- 测试模式:`tests/test_fundamental_context.py` 用 unittest + `SimpleNamespace` cfg + `patch("src.config.get_config", return_value=cfg)` + `DataFetcherManager(fetchers=[])`
+
+---
+
+### Task 1: 配置三件套与注册
+
+**Files:**
+- Modify: `src/config.py`(字段区 :717 后 + env 读取区 :1412 后)
+- Modify: `src/core/config_registry.py`(`_FIELD_DEFINITIONS` 内,`ENABLE_CHIP_DISTRIBUTION` 条目后)
+- Modify: `.env.example`(`# FUNDAMENTAL_CACHE_MAX_ENTRIES=256` 行后)
+- Create: `tests/test_identity_config.py`
+
+- [ ] **Step 1.1: 写失败测试**
+
+创建 `tests/test_identity_config.py`:
+
+```python
+# -*- coding: utf-8 -*-
+"""B1 身份痕迹块配置默认值与注册测试。"""
+
+import dataclasses
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+
+class TestIdentityConfigDefaults(unittest.TestCase):
+    def test_switch_defaults_off(self) -> None:
+        from src.config import Config
+
+        fields = {f.name: f for f in dataclasses.fields(Config)}
+        for name in (
+            "enable_holder_count_context",
+            "enable_margin_balance_context",
+            "enable_block_deals_context",
+        ):
+            self.assertIn(name, fields, f"missing config field: {name}")
+            self.assertIs(fields[name].default, False, name)
+
+    def test_budget_defaults(self) -> None:
+        from src.config import Config
+
+        fields = {f.name: f.default for f in dataclasses.fields(Config)}
+        self.assertEqual(fields.get("identity_stage_timeout_seconds"), 8.0)
+        self.assertEqual(fields.get("identity_fetch_timeout_seconds"), 3.0)
+        self.assertEqual(fields.get("identity_cache_ttl_seconds"), 21600)
+
+    def test_registry_entries_exist(self) -> None:
+        from src.core.config_registry import _FIELD_DEFINITIONS
+
+        for key in (
+            "ENABLE_HOLDER_COUNT_CONTEXT",
+            "ENABLE_MARGIN_BALANCE_CONTEXT",
+            "ENABLE_BLOCK_DEALS_CONTEXT",
+            "IDENTITY_STAGE_TIMEOUT_SECONDS",
+            "IDENTITY_FETCH_TIMEOUT_SECONDS",
+            "IDENTITY_CACHE_TTL_SECONDS",
+        ):
+            self.assertIn(key, _FIELD_DEFINITIONS, f"missing registry entry: {key}")
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 1.2: 运行确认失败**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_config.py -v`
+Expected: 3 个测试 FAIL/ERROR(missing config field / missing registry entry)
+
+- [ ] **Step 1.3: 加 config 字段**
+
+`src/config.py` 字段区,在 `fundamental_cache_max_entries: int = 256` 行后插入:
+
+```python
+
+    # === B1 身份痕迹块(股东户数/两融/大宗,默认关闭) ===
+    # 依赖 ENABLE_FUNDAMENTAL_PIPELINE=true;开启后作为 fundamental_context 的
+    # holder_count/margin_balance/block_deals 三块注入(capital_forensics 计分卡 9/10/11 项)
+    enable_holder_count_context: bool = False
+    enable_margin_balance_context: bool = False
+    enable_block_deals_context: bool = False
+    # 身份痕迹块独立预算(与 fundamental 五件套分离,不挤占 valuation/growth 等现有块)
+    identity_stage_timeout_seconds: float = 8.0
+    identity_fetch_timeout_seconds: float = 3.0
+    identity_cache_ttl_seconds: int = 21600
+```
+
+- [ ] **Step 1.4: 加 env 读取**
+
+`src/config.py` env 读取区,在 `enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',` 行后插入:
+
+```python
+            enable_holder_count_context=os.getenv('ENABLE_HOLDER_COUNT_CONTEXT', 'false').lower() == 'true',
+            enable_margin_balance_context=os.getenv('ENABLE_MARGIN_BALANCE_CONTEXT', 'false').lower() == 'true',
+            enable_block_deals_context=os.getenv('ENABLE_BLOCK_DEALS_CONTEXT', 'false').lower() == 'true',
+            identity_stage_timeout_seconds=parse_env_float(
+                os.getenv('IDENTITY_STAGE_TIMEOUT_SECONDS'),
+                8.0,
+                field_name='IDENTITY_STAGE_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            identity_fetch_timeout_seconds=parse_env_float(
+                os.getenv('IDENTITY_FETCH_TIMEOUT_SECONDS'),
+                3.0,
+                field_name='IDENTITY_FETCH_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            identity_cache_ttl_seconds=parse_env_int(
+                os.getenv('IDENTITY_CACHE_TTL_SECONDS'),
+                21600,
+                field_name='IDENTITY_CACHE_TTL_SECONDS',
+                minimum=0,
+            ),
+```
+
+- [ ] **Step 1.5: 注册 config_registry**
+
+`src/core/config_registry.py` 的 `_FIELD_DEFINITIONS` 中,`ENABLE_CHIP_DISTRIBUTION` 条目的闭括号后追加(注意保持 dict 逗号):
+
+```python
+    "ENABLE_HOLDER_COUNT_CONTEXT": {
+        "title": "Enable Holder Count Context",
+        "description": "Inject A-share holder-count series (quarterly, concentrating/dispersing trend) into fundamental context. Requires ENABLE_FUNDAMENTAL_PIPELINE=true.",
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 24,
+    },
+    "ENABLE_MARGIN_BALANCE_CONTEXT": {
+        "title": "Enable Margin Balance Context",
+        "description": "Inject A-share margin balance (latest 2 trading days) into fundamental context. Market-level daily cache. Requires ENABLE_FUNDAMENTAL_PIPELINE=true.",
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 25,
+    },
+    "ENABLE_BLOCK_DEALS_CONTEXT": {
+        "title": "Enable Block Deals Context",
+        "description": "Inject A-share block-trade deals (recent 5 trading days, premium-rate signal) into fundamental context. Requires ENABLE_FUNDAMENTAL_PIPELINE=true.",
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 26,
+    },
+    "IDENTITY_STAGE_TIMEOUT_SECONDS": {
+        "title": "Identity Context Stage Timeout (s)",
+        "description": "Shared stage budget in seconds for the three identity-context blocks (holder count / margin / block deals).",
+        "category": "data_source",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "8",
+        "options": [],
+        "validation": {},
+        "display_order": 27,
+    },
+    "IDENTITY_FETCH_TIMEOUT_SECONDS": {
+        "title": "Identity Context Fetch Timeout (s)",
+        "description": "Per-fetch timeout in seconds for identity-context data sources (akshare full-market tables).",
+        "category": "data_source",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "3",
+        "options": [],
+        "validation": {},
+        "display_order": 28,
+    },
+    "IDENTITY_CACHE_TTL_SECONDS": {
+        "title": "Identity Context Cache TTL (s)",
+        "description": "TTL in seconds for the per-stock holder-count context entry (market-level daily entries are immutable and exempt).",
+        "category": "data_source",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "21600",
+        "options": [],
+        "validation": {},
+        "display_order": 29,
+    },
+```
+
+- [ ] **Step 1.6: 登记 .env.example**
+
+`.env.example` 中 `# FUNDAMENTAL_CACHE_MAX_ENTRIES=256` 行后追加:
+
+```
+
+# B1 身份痕迹块：股东户数/两融余额/大宗交易注入 fundamental_context
+# (capital_forensics 计分卡第 9/10/11 项的数据来源)。三块默认关闭;需 ENABLE_FUNDAMENTAL_PIPELINE=true
+# ENABLE_HOLDER_COUNT_CONTEXT=false
+# ENABLE_MARGIN_BALANCE_CONTEXT=false
+# ENABLE_BLOCK_DEALS_CONTEXT=false
+# 身份痕迹块独立预算(秒)：三块共享的阶段总预算/单次抓取超时/个股上下文 TTL
+# (两融与大宗为按日全市场表,市场级日期缓存条目不可变,不受 TTL 淘汰,仅受容量淘汰)
+# IDENTITY_STAGE_TIMEOUT_SECONDS=8
+# IDENTITY_FETCH_TIMEOUT_SECONDS=3
+# IDENTITY_CACHE_TTL_SECONDS=21600
+```
+
+- [ ] **Step 1.7: 运行确认通过**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_config.py -v`
+Expected: 3 passed
+
+---
+
+### Task 2: adapter 股东户数方法
+
+**Files:**
+- Modify: `data_provider/fundamental_adapter.py`(模块级 helper 区 + `AkshareFundamentalAdapter` 类内)
+- Create: `tests/test_identity_adapter.py`
+
+- [ ] **Step 2.1: 写失败测试**
+
+创建 `tests/test_identity_adapter.py`:
+
+```python
+# -*- coding: utf-8 -*-
+"""B1 身份痕迹块 adapter 方法测试(全 mock,无网络)。"""
+
+import os
+import sys
+import unittest
+from unittest.mock import patch
+
+import pandas as pd
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+
+ADAPTER = AkshareFundamentalAdapter()
+
+HOLDER_DF = pd.DataFrame({
+    "股东户数统计日期": ["2025-12-31", "2026-03-31", "2026-06-30", "2026-08-31"],
+    "股东户数": [52000, 55000, 60000, 48000],
+    "股东户数-增减比例": [-3.0, 5.77, 9.09, -20.0],
+    "户均持股数": [20833.0, 19700.0, 18000.0, 22500.0],
+    "户均持股市值": [2.9e6, 3.1e6, 3.3e6, 3.2e6],
+})
+
+
+class TestHolderCountSeries(unittest.TestCase):
+    def _run(self, df):
+        with patch.object(ADAPTER, "_call_df_candidates", return_value=(df, "stock_zh_a_gdhs", [])):
+            return ADAPTER.get_holder_count_series("600519")
+
+    def test_series_and_trend_concentrating(self) -> None:
+        df = HOLDER_DF.copy()
+        df["股东户数-增减比例"] = [-3.0, 5.77, -5.0, -20.0]
+        result = self._run(df)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["trend"], "concentrating")
+        self.assertEqual(result["latest"]["holder_num"], 48000)
+        self.assertEqual(len(result["series"]), 4)
+        self.assertEqual(result["series"][0]["end_date"], "20251231")
+
+    def test_trend_dispersing(self) -> None:
+        df = HOLDER_DF.copy()
+        df["股东户数-增减比例"] = [-3.0, 5.0, 9.09, 20.0]
+        result = self._run(df)
+        self.assertEqual(result["trend"], "dispersing")
+
+    def test_trend_flat_mixed(self) -> None:
+        df = HOLDER_DF.copy()
+        df["股东户数-增减比例"] = [-3.0, 5.0, -9.09, 20.0]
+        result = self._run(df)
+        self.assertEqual(result["trend"], "flat")
+
+    def test_none_df_returns_not_supported(self) -> None:
+        with patch.object(ADAPTER, "_call_df_candidates", return_value=(None, None, ["x:Err"])):
+            result = ADAPTER.get_holder_count_series("600519")
+        self.assertNotEqual(result["status"], "ok")
+        self.assertEqual(result["series"], [])
+        self.assertIn("x:Err", result["errors"])
+
+    def test_series_capped_at_8(self) -> None:
+        rows = 12
+        df = pd.DataFrame({
+            "股东户数统计日期": [f"2025-{m:02d}-28" for m in range(1, 13)],
+            "股东户数": [50000 + i * 100 for i in range(rows)],
+            "股东户数-增减比例": [1.0] * rows,
+        })
+        result = self._run(df)
+        self.assertEqual(len(result["series"]), 8)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2.2: 运行确认失败**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py -v`
+Expected: ERROR/FAIL(`get_holder_count_series` 不存在)
+
+- [ ] **Step 2.3: 实现 helper 与方法**
+
+`data_provider/fundamental_adapter.py` 模块级 helper 区(`_pick_by_keywords` 定义附近)加入:
+
+```python
+def _find_col(
+    df: pd.DataFrame,
+    keys: List[str],
+    exclude: tuple = (),
+) -> Optional[str]:
+    """按候选关键词找列:先全等匹配,再子串匹配(可排除含排除词的列)。akshare 列名跨版本漂移,统一走此入口。"""
+    for col in df.columns:
+        if str(col) in keys:
+            return col
+    for col in df.columns:
+        col_str = str(col)
+        if any(k in col_str for k in keys) and not any(e in col_str for e in exclude):
+            return col
+    return None
+```
+
+(若文件顶部尚未导入 `List`/`Optional`,在既有 typing 导入行补齐。)
+
+`AkshareFundamentalAdapter` 类内(`get_dragon_tiger_flag` 方法后)加入:
+
+```python
+    def get_holder_count_series(self, stock_code: str) -> Dict[str, Any]:
+        """股东户数序列(B1 holder_count 块数据源,计分卡第 9 项)。"""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "latest": {},
+            "series": [],
+            "trend": "flat",
+            "source_chain": [],
+            "errors": [],
+        }
+        target = _normalize_code(stock_code)
+        df, source, errors = self._call_df_candidates([
+            ("stock_zh_a_gdhs", {"symbol": target}),
+            ("stock_zh_a_gdhs_detail_em", {"symbol": target}),
+        ])
+        result["errors"].extend(errors)
+        if df is None:
+            return result
+
+        code_col = _find_col(df, ["代码"])
+        if code_col is not None:
+            try:
+                df = df[df[code_col].astype(str).map(_normalize_code) == target]
+            except Exception:
+                pass
+        if df is None or df.empty:
+            result["status"] = "partial"
+            return result
+
+        date_col = _find_col(df, ["日期", "截止日"])
+        num_col = _find_col(df, ["股东户数"], exclude=("增减", "比例", "幅", "户均"))
+        if date_col is None or num_col is None:
+            result["status"] = "partial"
+            return result
+        ratio_col = _find_col(df, ["增减比例", "增减幅", "较上期"])
+        avg_hold_col = _find_col(df, ["户均持股数", "户均持股"], exclude=("市值", "金额"))
+        avg_amt_col = _find_col(df, ["户均持股市值", "户均市值"])
+
+        rows: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            try:
+                dt = pd.to_datetime(str(row[date_col]))
+            except Exception:
+                continue
+            rows.append({
+                "end_date": dt.strftime("%Y%m%d"),
+                "holder_num": int(_safe_float(row[num_col]) or 0),
+                "holder_num_change_pct": _safe_float(row[ratio_col]) if ratio_col else None,
+                "avg_hold_num": _safe_float(row[avg_hold_col]) if avg_hold_col else None,
+                "avg_hold_amount": _safe_float(row[avg_amt_col]) if avg_amt_col else None,
+            })
+        rows.sort(key=lambda r: r["end_date"])
+        series = rows[-8:]
+        if not series:
+            result["status"] = "partial"
+            return result
+
+        trend = "flat"
+        ratios = [r["holder_num_change_pct"] for r in series[-2:]]
+        valid = [x for x in ratios if x is not None]
+        if len(valid) == 2:
+            if valid[0] < 0 and valid[1] < 0:
+                trend = "concentrating"
+            elif valid[0] > 0 and valid[1] > 0:
+                trend = "dispersing"
+
+        result["latest"] = series[-1]
+        result["series"] = series
+        result["trend"] = trend
+        result["status"] = "ok"
+        result["source_chain"].append(f"holder_count:{source}")
+        return result
+```
+
+- [ ] **Step 2.4: 运行确认通过**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py -v`
+Expected: 5 passed
+
+---
+
+### Task 3: 两融块(市场级日期缓存 + adapter 行提取)
+
+**Files:**
+- Modify: `data_provider/fundamental_adapter.py`(类内加 2 个方法)
+- Modify: `data_provider/base.py`(`_prune_fundamental_cache` 改 TTL 跳过;缓存 helper;`get_margin_balance_context`)
+- Modify: `tests/test_identity_adapter.py`(追加)
+
+- [ ] **Step 3.1: 写失败测试**
+
+`tests/test_identity_adapter.py` 追加(文件顶部 import 补 `from data_provider.base import DataFetcherManager`、`from src.config import get_config as _real_get_config` 不需要——patch 方式见下;`SimpleNamespace`):
+
+```python
+from types import SimpleNamespace
+
+from data_provider.base import DataFetcherManager
+
+MARGIN_DF_SSE = pd.DataFrame({
+    "信用交易日期": ["2026-09-22", "2026-09-22"],
+    "标的证券代码": ["600519", "600000"],
+    "标的证券简称": ["贵州茅台", "浦发银行"],
+    "融资余额": [2.1e9, 1.5e9],
+    "融资买入额": [3.0e8, 2.0e8],
+})
+
+
+def _identity_cfg(**over):
+    cfg = SimpleNamespace(
+        enable_fundamental_pipeline=True,
+        fundamental_cache_ttl_seconds=120,
+        fundamental_cache_max_entries=256,
+        fundamental_stage_timeout_seconds=0.01,
+        fundamental_fetch_timeout_seconds=0.01,
+        fundamental_retry_max=1,
+        enable_holder_count_context=False,
+        enable_margin_balance_context=False,
+        enable_block_deals_context=False,
+        identity_stage_timeout_seconds=5.0,
+        identity_fetch_timeout_seconds=2.0,
+        identity_cache_ttl_seconds=21600,
+    )
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+class TestMarginBalanceContext(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manager = DataFetcherManager(fetchers=[])
+
+    def test_sse_routing_and_two_days(self) -> None:
+        fetch = unittest.mock.Mock(return_value=MARGIN_DF_SSE)
+        with patch.object(self.manager._fundamental_adapter, "fetch_margin_df", side_effect=fetch), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            block = self.manager.get_margin_balance_context("600519")
+        self.assertEqual(block["status"], "ok")
+        self.assertAlmostEqual(block["data"]["latest"]["rzye_yi"], 21.0)
+        self.assertIsNotNone(block["data"]["latest"]["change_pct_1d"])
+        # 2 个交易日 → 2 次 fetch
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_market_level_cache_shared_across_stocks(self) -> None:
+        fetch = unittest.mock.Mock(return_value=MARGIN_DF_SSE)
+        with patch.object(self.manager._fundamental_adapter, "fetch_margin_df", side_effect=fetch), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            self.manager.get_margin_balance_context("600519")
+            self.manager.get_margin_balance_context("600519")
+            block = self.manager.get_margin_balance_context("600000")
+        self.assertEqual(block["status"], "ok")
+        self.assertEqual(fetch.call_count, 2)  # 同日市场级缓存命中,不再发请求
+
+    def test_non_trading_fallback_partial(self) -> None:
+        # 首个探测日(今天)无数据,次日有 → 仅 1 行,partial,change_pct None
+        fetch = unittest.mock.Mock(side_effect=[None, MARGIN_DF_SSE])
+        with patch.object(self.manager._fundamental_adapter, "fetch_margin_df", side_effect=fetch), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            block = self.manager.get_margin_balance_context("600519")
+        self.assertEqual(block["status"], "partial")
+        self.assertIsNone(block["data"]["latest"]["change_pct_1d"])
+
+    def test_bse_not_supported(self) -> None:
+        fetch = unittest.mock.Mock()
+        with patch.object(self.manager._fundamental_adapter, "fetch_margin_df", side_effect=fetch), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            block = self.manager.get_margin_balance_context("830799")
+        self.assertEqual(block["status"], "not_supported")
+        fetch.assert_not_called()
+
+    def test_all_days_failed(self) -> None:
+        fetch = unittest.mock.Mock(return_value=None)
+        with patch.object(self.manager._fundamental_adapter, "fetch_margin_df", side_effect=fetch), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            block = self.manager.get_margin_balance_context("600519")
+        self.assertEqual(block["status"], "failed")
+```
+
+(注:`unittest.mock` 需在文件顶部 `import unittest.mock` 或直接 `from unittest.mock import Mock`——按现有导入风格统一为后者,把上文 `unittest.mock.Mock` 全部替换为 `Mock`。)
+
+- [ ] **Step 3.2: 运行确认失败**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py -v`
+Expected: 新增用例 FAIL/ERROR(`fetch_margin_df`/`get_margin_balance_context` 不存在)
+
+- [ ] **Step 3.3: adapter 加抓取与提取方法**
+
+`AkshareFundamentalAdapter` 类内(`get_holder_count_series` 后)加:
+
+```python
+    def fetch_margin_df(self, market: str, date_str: str) -> Optional[pd.DataFrame]:
+        """两融全市场日表(market: sse|szse;date_str: YYYYMMDD)。"""
+        if market == "sse":
+            candidates = [("stock_margin_detail_sse", {"date": date_str})]
+        else:
+            candidates = [("stock_margin_detail_szse", {"date": date_str})]
+        df, _source, _errors = self._call_df_candidates(candidates)
+        return df
+
+    def extract_margin_row(self, df: pd.DataFrame, stock_code: str) -> Optional[Dict[str, Any]]:
+        """从两融全市场表过滤本股并提取融资余额(单位:亿元)。纯函数,无网络。"""
+        code_col = _find_col(df, ["代码"])
+        if code_col is None:
+            return None
+        target = _normalize_code(stock_code)
+        try:
+            matched = df[df[code_col].astype(str).map(_normalize_code) == target]
+        except Exception:
+            return None
+        if matched.empty:
+            return None
+        rzye_col = _find_col(df, ["融资余额"])
+        if rzye_col is None:
+            return None
+        rzye = _safe_float(matched.iloc[0][rzye_col])
+        if rzye is None:
+            return None
+        return {"rzye_yi": round(rzye / 1e8, 3)}
+```
+
+- [ ] **Step 3.4: manager 缓存 helper + prune 修改**
+
+`data_provider/base.py` `_prune_fundamental_cache`(:645)的 TTL 段,把:
+
+```python
+                expired_keys = [
+                    key
+                    for key, value in cache_items
+                    if now_ts - float(value.get("ts", 0)) > ttl_seconds
+                ]
+```
+
+改为(市场级日期条目 `identity:` 前缀不可变,免 TTL;容量淘汰段不动):
+
+```python
+                expired_keys = [
+                    key
+                    for key, value in cache_items
+                    if not key.startswith("identity:mkt:")
+                    and now_ts - float(value.get("ts", 0)) > ttl_seconds
+                ]
+```
+
+`_prune_fundamental_cache` 方法后(:666 附近)加新方法:
+
+```python
+    def _get_identity_market_frame(
+        self,
+        block: str,
+        market: str,
+        date_str: str,
+        fetch_fn: Callable[[], Optional[pd.DataFrame]],
+        deadline: float,
+    ) -> Optional[pd.DataFrame]:
+        """市场级日期缓存读取(identity:mkt: 前缀条目不可变,命中免 TTL,仅容量淘汰)。"""
+        key = f"identity:mkt:{block}:{market}:{date_str}"
+        with self._fundamental_cache_lock:
+            item = self._fundamental_cache.get(key)
+            if item and item.get("frame") is not None:
+                return item["frame"]
+        if time.time() >= deadline:
+            return None
+        try:
+            df = fetch_fn()
+        except Exception:
+            return None
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[key] = {"ts": time.time(), "frame": df}
+            return df
+        return None
+```
+
+(确认 `Callable` 已在 base.py 的 typing 导入中;若无则补。)
+
+- [ ] **Step 3.5: manager 两融块方法**
+
+`data_provider/base.py` `get_dragon_tiger_context` 方法后加:
+
+```python
+    def get_margin_balance_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """两融余额块(B1,计分卡第 10 项;市场级日期缓存,fail-open)。"""
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+        prefix = stock_code[:1]
+        if prefix == "6":
+            market = "sse"
+        elif prefix in ("0", "3"):
+            market = "szse"
+        else:
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["margin detail only supports sse/szse"],
+            )
+        stage_budget = float(
+            budget_seconds if budget_seconds is not None else getattr(config, "identity_stage_timeout_seconds", 8.0)
+        )
+        deadline = time.time() + max(0.0, stage_budget)
+        fetch_timeout = float(getattr(config, "identity_fetch_timeout_seconds", 3.0))
+        chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        rows: List[Dict[str, Any]] = []
+        day = datetime.now().date()
+        for _ in range(7):
+            if len(rows) >= 2 or time.time() > deadline:
+                break
+            date_str = day.strftime("%Y%m%d")
+            day = day - timedelta(days=1)
+
+            def _fetch(d: str = date_str) -> Optional[pd.DataFrame]:
+                result, _err, _ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.fetch_margin_df(market, d),
+                    min(fetch_timeout, max(0.0, deadline - time.time())),
+                    "margin_balance",
+                )
+                if isinstance(result, pd.DataFrame) and not result.empty:
+                    return result
+                return None
+
+            frame = self._get_identity_market_frame("margin", market, date_str, _fetch, deadline)
+            if frame is None:
+                continue
+            row = self._fundamental_adapter.extract_margin_row(frame, stock_code)
+            if row:
+                rows.append({"date": date_str, **row})
+        if not rows:
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                chain,
+                errors or ["no margin data in recent 7d"],
+            )
+        latest = rows[0]
+        prev = rows[1] if len(rows) > 1 else None
+        change_pct = None
+        if prev and prev.get("rzye_yi"):
+            change_pct = round((latest["rzye_yi"] - prev["rzye_yi"]) / prev["rzye_yi"] * 100, 3)
+        payload = {
+            "latest": {"date": latest["date"], "rzye_yi": latest["rzye_yi"], "change_pct_1d": change_pct},
+            "reading_note": "低位融资余额持续增加=有信心的杠杆资金;高位激增=散户杠杆接盘(派发确认);破位后放量=强平负反馈,不计价格。",
+            "source": "ak.stock_margin_detail_sse/szse",
+        }
+        return self._build_fundamental_block("ok" if len(rows) >= 2 else "partial", payload, chain, errors)
+```
+
+- [ ] **Step 3.6: 运行确认通过**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py -v`
+Expected: 10 passed(Task 2 的 5 个 + 本任务 5 个)
+
+---
+
+### Task 4: 大宗交易块
+
+**Files:**
+- Modify: `data_provider/fundamental_adapter.py`(类内加 2 个方法)
+- Modify: `data_provider/base.py`(`get_margin_balance_context` 后加块方法)
+- Modify: `tests/test_identity_adapter.py`(追加)
+
+- [ ] **Step 4.1: 写失败测试**
+
+`tests/test_identity_adapter.py` 追加:
+
+```python
+def _dzjy_df(rates, code="600519"):
+    return pd.DataFrame({
+        "交易日期": ["2026-09-18"] * len(rates),
+        "证券代码": [code] * len(rates),
+        "证券简称": ["贵州茅台"] * len(rates),
+        "成交价": [1500.0] * len(rates),
+        "成交量": [100000] * len(rates),
+        "成交额": [1.5e8] * len(rates),
+        "折溢率": rates,
+    })
+
+
+class TestBlockDealsContext(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manager = DataFetcherManager(fetchers=[])
+
+    def _block(self, frames_by_probe):
+        # 探测从最近一天开始依次调用;frames_by_probe 为按调用序的 frame 列表(None=该日无数据)
+        with patch.object(
+            self.manager._fundamental_adapter, "fetch_block_deals_df", side_effect=frames_by_probe
+        ), patch("src.config.get_config", return_value=_identity_cfg()):
+            return self.manager.get_block_deals_context("600519")
+
+    def test_signal_narrowing(self) -> None:
+        # 探测序 d0..d4;d0/d1(最近 2 日)收窄,d2/d3/d4(最早 3 日)深折价
+        frames = [_dzjy_df([-1.0]), _dzjy_df([-1.0]), _dzjy_df([-9.5]), _dzjy_df([-9.5]), _dzjy_df([-9.5])]
+        block = self._block(frames)
+        self.assertEqual(block["data"]["signal_note"], "narrowing")
+
+    def test_signal_deep_discount(self) -> None:
+        frames = [_dzjy_df([-9.5])] * 5
+        block = self._block(frames)
+        self.assertEqual(block["data"]["signal_note"], "deep_discount")
+
+    def test_signal_premium(self) -> None:
+        frames = [_dzjy_df([0.5])] * 5
+        block = self._block(frames)
+        self.assertEqual(block["data"]["signal_note"], "premium")
+
+    def test_signal_normal(self) -> None:
+        frames = [_dzjy_df([-1.0])] * 5
+        block = self._block(frames)
+        self.assertEqual(block["data"]["signal_note"], "normal")
+
+    def test_signal_none_when_stock_absent(self) -> None:
+        frames = [_dzjy_df([-9.5], code="600000")] * 5
+        block = self._block(frames)
+        self.assertEqual(block["data"]["signal_note"], "none")
+        self.assertEqual(block["data"]["recent_5d"]["deal_count"], 0)
+
+    def test_failed_when_no_frame(self) -> None:
+        block = self._block([None] * 10)
+        self.assertEqual(block["status"], "failed")
+```
+
+- [ ] **Step 4.2: 运行确认失败**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py -v`
+Expected: 新增 6 例 FAIL/ERROR
+
+- [ ] **Step 4.3: adapter 方法**
+
+`AkshareFundamentalAdapter` 类内(`extract_margin_row` 后)加:
+
+```python
+    def fetch_block_deals_df(self, dash_date: str, compact_date: str) -> Optional[pd.DataFrame]:
+        """大宗交易全市场日明细(两种日期格式候选,实际形态以真机验证为准)。"""
+        df, _source, _errors = self._call_df_candidates([
+            ("stock_dzjy_mrmx", {"trade_date": dash_date}),
+            ("stock_dzjy_mrmx", {"trade_date": compact_date}),
+        ])
+        return df
+
+    def extract_block_deal_rows(self, df: pd.DataFrame, stock_code: str) -> List[Dict[str, Any]]:
+        """从大宗日明细过滤本股的当日全部成交(折溢率%、成交额亿元、买卖营业部)。纯函数。"""
+        code_col = _find_col(df, ["代码"])
+        if code_col is None:
+            return []
+        target = _normalize_code(stock_code)
+        try:
+            matched = df[df[code_col].astype(str).map(_normalize_code) == target]
+        except Exception:
+            return []
+        premium_col = _find_col(df, ["折溢率", "折溢价", "溢价率"])
+        amount_col = _find_col(df, ["成交额"])
+        buyer_col = _find_col(df, ["买方营业部", "买方"])
+        seller_col = _find_col(df, ["卖方营业部", "卖方"])
+        rows: List[Dict[str, Any]] = []
+        for _, row in matched.iterrows():
+            amount = _safe_float(row[amount_col]) if amount_col else None
+            rows.append({
+                "premium_rate": _safe_float(row[premium_col]) if premium_col else None,
+                "amount_yi": round(amount / 1e8, 4) if amount is not None else None,
+                "buyer_branch": str(row[buyer_col]) if buyer_col else None,
+                "seller_branch": str(row[seller_col]) if seller_col else None,
+            })
+        return rows
+```
+
+- [ ] **Step 4.4: manager 块方法**
+
+`data_provider/base.py` `get_margin_balance_context` 后加:
+
+```python
+    def get_block_deals_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """大宗交易块(B1,计分卡第 11 项;最近 5 个交易日聚合,市场级日期缓存,fail-open)。"""
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+        stage_budget = float(
+            budget_seconds if budget_seconds is not None else getattr(config, "identity_stage_timeout_seconds", 8.0)
+        )
+        deadline = time.time() + max(0.0, stage_budget)
+        fetch_timeout = float(getattr(config, "identity_fetch_timeout_seconds", 3.0))
+        chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        days: List[str] = []  # 探测序=日期降序
+        deals: List[Dict[str, Any]] = []
+        day = datetime.now().date()
+        for _ in range(10):
+            if len(days) >= 5 or time.time() > deadline:
+                break
+            date_str = day.strftime("%Y%m%d")
+            day = day - timedelta(days=1)
+
+            def _fetch(d: str = date_str) -> Optional[pd.DataFrame]:
+                dash = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                result, _err, _ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.fetch_block_deals_df(dash, d),
+                    min(fetch_timeout, max(0.0, deadline - time.time())),
+                    "block_deals",
+                )
+                if isinstance(result, pd.DataFrame) and not result.empty:
+                    return result
+                return None
+
+            frame = self._get_identity_market_frame("dzjy", "all", date_str, _fetch, deadline)
+            if frame is None:
+                continue
+            days.append(date_str)
+            for r in self._fundamental_adapter.extract_block_deal_rows(frame, stock_code):
+                deals.append({"date": date_str, **r})
+        if not days:
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                chain,
+                errors or ["no block-deal frames in recent 10d"],
+            )
+        rates = [d["premium_rate"] for d in deals if d.get("premium_rate") is not None]
+        amounts = [d["amount_yi"] for d in deals if d.get("amount_yi") is not None]
+        early_dates = set(days[-3:])   # 窗口内最早的 3 个交易日
+        late_dates = set(days[:2])     # 最近的 2 个交易日
+        early_rates = [d["premium_rate"] for d in deals if d["date"] in early_dates and d.get("premium_rate") is not None]
+        late_rates = [d["premium_rate"] for d in deals if d["date"] in late_dates and d.get("premium_rate") is not None]
+        avg_rate = round(sum(rates) / len(rates), 3) if rates else None
+        if not deals:
+            signal = "none"
+        elif early_rates and min(early_rates) <= -8 and late_rates and all(r > -5 for r in late_rates):
+            signal = "narrowing"
+        elif rates and min(rates) <= -8:
+            signal = "deep_discount"
+        elif rates and sum(rates) / len(rates) > 0:
+            signal = "premium"
+        else:
+            signal = "normal"
+        payload = {
+            "recent_5d": {
+                "deal_count": len(deals),
+                "total_amount_yi": round(sum(amounts), 3) if amounts else None,
+                "avg_premium_rate": avg_rate,
+                "min_premium_rate": round(min(rates), 3) if rates else None,
+                "max_premium_rate": round(max(rates), 3) if rates else None,
+            },
+            "latest": {k: deals[0][k] for k in ("date", "premium_rate", "amount_yi", "buyer_branch", "seller_branch")} if deals else None,
+            "signal_note": signal,
+            "reading_note": "持续深折价(≤-8%)=卖方急于离场不惜成本,接盘方到账即卖有次日抛压;折价收窄=抛压减轻;溢价成交=无法表演的最强承接信号。",
+            "source": "ak.stock_dzjy_mrmx",
+        }
+        return self._build_fundamental_block("ok", payload, chain, errors)
+```
+
+- [ ] **Step 4.5: 运行确认通过**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py -v`
+Expected: 16 passed
+
+---
+
+### Task 5: holder_count 块 + get_fundamental_context 接线
+
+**Files:**
+- Modify: `data_provider/base.py`(`get_margin_balance_context` 前加 holder 块方法;`get_fundamental_context` 五处接线)
+- Modify: `tests/test_identity_adapter.py`(追加集成用例)
+
+- [ ] **Step 5.1: 写失败测试**
+
+`tests/test_identity_adapter.py` 追加:
+
+```python
+class TestHolderCountContextBlock(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manager = DataFetcherManager(fetchers=[])
+
+    def test_block_maps_payload(self) -> None:
+        payload = {
+            "status": "ok",
+            "latest": {"end_date": "20260831", "holder_num": 48000, "holder_num_change_pct": -20.0},
+            "series": [{"end_date": "20260831", "holder_num": 48000, "holder_num_change_pct": -20.0}],
+            "trend": "concentrating",
+            "source_chain": ["holder_count:stock_zh_a_gdhs"],
+            "errors": [],
+        }
+        with patch.object(self.manager._fundamental_adapter, "get_holder_count_series", return_value=payload), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            block = self.manager.get_holder_count_context("600519")
+        self.assertEqual(block["status"], "ok")
+        self.assertEqual(block["data"]["trend"], "concentrating")
+        self.assertIn("reading_note", block["data"])
+
+    def test_adapter_failure_failed_block(self) -> None:
+        with patch.object(self.manager._fundamental_adapter, "get_holder_count_series", return_value=None), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            block = self.manager.get_holder_count_context("600519")
+        self.assertEqual(block["status"], "failed")
+
+    def test_holder_block_cached_per_stock(self) -> None:
+        payload = {"status": "ok", "latest": {}, "series": [], "trend": "flat", "source_chain": [], "errors": []}
+        call = Mock(return_value=payload)
+        with patch.object(self.manager._fundamental_adapter, "get_holder_count_series", side_effect=call), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            b1 = self.manager.get_holder_count_context("600519")
+            b2 = self.manager.get_holder_count_context("600519")
+        self.assertEqual(b1, b2)
+        self.assertEqual(call.call_count, 1)  # 个股级 TTL 缓存命中,第二次不发请求
+
+
+class TestIdentityWiring(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manager = DataFetcherManager(fetchers=[])
+
+    def test_switches_off_no_requests(self) -> None:
+        holder = Mock()
+        with patch.object(self.manager._fundamental_adapter, "get_holder_count_series", side_effect=holder), \
+                patch.object(self.manager._fundamental_adapter, "fetch_margin_df", side_effect=Mock()), \
+                patch.object(self.manager._fundamental_adapter, "fetch_block_deals_df", side_effect=Mock()), \
+                patch("src.config.get_config", return_value=_identity_cfg()):
+            ctx = self.manager.get_fundamental_context("600519")
+        holder.assert_not_called()
+        self.assertEqual(ctx["coverage"].get("holder_count"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("margin_balance"), "not_supported")
+        self.assertEqual(ctx["coverage"].get("block_deals"), "not_supported")
+
+    def test_switch_on_blocks_injected(self) -> None:
+        payload = {
+            "status": "ok",
+            "latest": {"end_date": "20260831", "holder_num": 48000},
+            "series": [],
+            "trend": "concentrating",
+            "source_chain": [],
+            "errors": [],
+        }
+        cfg = _identity_cfg(enable_holder_count_context=True)
+        with patch.object(self.manager._fundamental_adapter, "get_holder_count_series", return_value=payload), \
+                patch("src.config.get_config", return_value=cfg):
+            ctx = self.manager.get_fundamental_context("600519")
+        self.assertEqual(ctx["coverage"].get("holder_count"), "ok")
+        self.assertEqual(ctx["holder_count"]["data"]["trend"], "concentrating")
+```
+
+(顶部 import 行补 `Mock`。)
+
+- [ ] **Step 5.2: 运行确认失败**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py -v`
+Expected: 新增用例 FAIL/ERROR(`get_holder_count_context` 不存在 / coverage 无该键)
+
+- [ ] **Step 5.3: manager holder 块方法**
+
+`data_provider/base.py`,`get_margin_balance_context` **之前**加:
+
+```python
+    def get_holder_count_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """股东户数块(B1,计分卡第 9 项;季度序列与集中/分散趋势,fail-open)。"""
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+        stage_budget = float(
+            budget_seconds if budget_seconds is not None else getattr(config, "identity_stage_timeout_seconds", 8.0)
+        )
+        # 个股级 TTL 缓存(identity_cache_ttl_seconds 的消费点;季度数据,TTL 默认 6h)
+        cache_ttl = int(getattr(config, "identity_cache_ttl_seconds", 21600))
+        cache_key = f"identity:stock:holder:{stock_code}"
+        if cache_ttl > 0:
+            with self._fundamental_cache_lock:
+                item = self._fundamental_cache.get(cache_key)
+                if item and time.time() - float(item.get("ts", 0)) <= cache_ttl:
+                    return dict(item.get("block", {}))
+        if stage_budget <= 0:
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
+                ["identity stage timeout"],
+            )
+        fetch_timeout = min(float(getattr(config, "identity_fetch_timeout_seconds", 3.0)), stage_budget)
+        payload, err, cost_ms = self._run_with_retry(
+            lambda: self._fundamental_adapter.get_holder_count_series(stock_code),
+            fetch_timeout,
+            "holder_count",
+        )
+        if not isinstance(payload, dict):
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
+                [err or "holder_count failed"],
+            )
+        status = payload.get("status")
+        data = {
+            "latest": payload.get("latest", {}),
+            "series": payload.get("series", []),
+            "trend": payload.get("trend", "flat"),
+            "reading_note": "户数下降+股价上涨=主升健康;户数下降+横盘=吸筹期;户数上升+股价上涨=派发危险(散户接盘);户数上升+下跌=回避。",
+            "source": "ak.stock_zh_a_gdhs",
+        }
+        block = self._build_fundamental_block(
+            status if isinstance(status, str) else "partial",
+            data,
+            self._normalize_source_chain(
+                payload.get("source_chain", []),
+                "holder_count",
+                str(status or "partial"),
+                cost_ms,
+            ),
+            list(payload.get("errors", [])) + ([err] if err else []),
+        )
+        if cache_ttl > 0 and block.get("status") == "ok":
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[cache_key] = {"ts": time.time(), "block": block}
+        return block
+```
+
+- [ ] **Step 5.4: get_fundamental_context 五处接线**
+
+`data_provider/base.py` `get_fundamental_context` 内:
+
+(a) result_ctx 初始化 dict(约 :2130,`"boards": {},` 行后)加:
+
+```python
+            "holder_count": {},
+            "margin_balance": {},
+            "block_deals": {},
+```
+
+(b) ETF 分支(约 :2311-2333,`result_ctx["boards"] = self._build_fundamental_block("not_supported", ...)` 块后、`result_ctx["status"] = "partial"` 前)加同形三块:
+
+```python
+            result_ctx["holder_count"] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["etf not fully supported"],
+            )
+            result_ctx["margin_balance"] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["etf not fully supported"],
+            )
+            result_ctx["block_deals"] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["etf not fully supported"],
+            )
+```
+
+(c) else 分支,`result_ctx["boards"] = self.get_board_context(...)` 调用后加(**独立预算,不消耗 `remaining_seconds`**;块开关关闭时保持 `{}`,coverage 默认读出 not_supported 且零请求):
+
+```python
+            # B1 身份痕迹块(默认关闭;独立预算,不占用 fundamental stage 预算)
+            identity_remaining = float(getattr(config, "identity_stage_timeout_seconds", 8.0))
+            if getattr(config, "enable_holder_count_context", False) and identity_remaining > 0:
+                _t0 = time.time()
+                result_ctx["holder_count"] = self.get_holder_count_context(
+                    stock_code, budget_seconds=identity_remaining
+                )
+                identity_remaining = max(0.0, identity_remaining - (time.time() - _t0))
+            if getattr(config, "enable_margin_balance_context", False) and identity_remaining > 0:
+                _t0 = time.time()
+                result_ctx["margin_balance"] = self.get_margin_balance_context(
+                    stock_code, budget_seconds=identity_remaining
+                )
+                identity_remaining = max(0.0, identity_remaining - (time.time() - _t0))
+            if getattr(config, "enable_block_deals_context", False) and identity_remaining > 0:
+                _t0 = time.time()
+                result_ctx["block_deals"] = self.get_block_deals_context(
+                    stock_code, budget_seconds=identity_remaining
+                )
+```
+
+(d) `block_statuses` dict(约 :2345-2352)追加三行:
+
+```python
+            "holder_count": result_ctx["holder_count"].get("status", "not_supported"),
+            "margin_balance": result_ctx["margin_balance"].get("status", "not_supported"),
+            "block_deals": result_ctx["block_deals"].get("status", "not_supported"),
+```
+
+(e) 尾部 `for block in ("valuation", ..., "boards",):` 元组(约 :2355-2363)追加 `"holder_count", "margin_balance", "block_deals"`;`_should_cache_fundamental_context`(:1975-1983)的同名元组做相同追加。
+
+- [ ] **Step 5.5: 运行确认通过(含既有回归)**
+
+Run: `/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_adapter.py tests/test_identity_config.py tests/test_fundamental_context.py -v`
+Expected: 全部 passed(既有 test_fundamental_context.py 用 SimpleNamespace cfg 无 identity 字段——getattr 默认值保证不炸)
+
+---
+
+### Task 6: 消费端资产同步(YAML / 方法论文档 / CHANGELOG)
+
+**Files:**
+- Modify: `strategies/capital_forensics.yaml`
+- Modify: `docs/capital-forensics-philosophy.md`(第 10 章)
+- Modify: `docs/CHANGELOG.md`
+
+- [ ] **Step 6.1: YAML 计分卡补三项**
+
+`strategies/capital_forensics.yaml` 第三步,在 `7. **换手-振幅矩阵**(±1)` 条目之后、`数据不可得项` 段之前插入:
+
+```
+  8. **股东户数**(±2，方法论第 9 项)：若分析上下文含 holder_count 块（fundamental_context 注入），
+     trend="concentrating" → +2（吸筹/主升）；trend="dispersing" → -2（派发/分散）；
+     块缺失或 trend="flat" → 记 0 并列入待验证清单。
+  9. **融资余额**(±1，方法论第 10 项)：margin_balance 块——低位区 change_pct_1d 连续为正 → +1；
+     高位区（大涨后）change_pct_1d 明显为正 → -1（散户杠杆接盘）；块缺失 → 记 0。
+  10. **大宗交易折溢价**(±1，方法论第 11 项)：block_deals 块 signal_note——"premium" → +1；
+      "deep_discount" → -1；"narrowing" → 0（中性偏暖）；"normal"/"none" → 0；块缺失 → 记 0。
+```
+
+- [ ] **Step 6.2: YAML 不可得清单与阈值注更新**
+
+将现有:
+
+```
+  数据不可得项**显式跳过并在输出中列出**（不做静默省略）：分时结构、盘口大单、
+  股东户数、融资余额、大宗交易折溢价、龙虎榜席位、历史事件日回溯
+  （B 阶段数据接入后自动生效）。
+```
+
+改为:
+
+```
+  数据不可得项**显式跳过并在输出中列出**（不做静默省略）：分时结构、盘口大单、
+  龙虎榜席位明细、历史事件日回溯（待后续数据接入）。
+  股东户数/融资余额/大宗交易已由 fundamental_context 的 holder_count/margin_balance/
+  block_deals 三块自动注入（需开启 ENABLE_HOLDER_COUNT_CONTEXT 等开关，默认关闭；
+  开关未开启时第 8/9/10 项按缺失处理，记 0）。
+```
+
+判定行(现 `判定（按 7 项可算子集标定...）`)改为:
+
+```
+  判定（阈值维持 ±4：开关全开时有效项 10 个，未开启时回落到 7 项，阈值不变，保守处理；
+  完整 12 项计分卡阈值为 ≥+5/≤-5，见方法论文档）：
+  总分 ≥ +4 → 高置信吸筹；≤ -4 → 高置信派发；-3 ~ +3 → 证据不足，输出"不动作"。
+```
+
+- [ ] **Step 6.3: 方法论文档第 10 章三档迁移**
+
+`docs/capital-forensics-philosophy.md` 第 10 章 ⚠️ 段:将"股东户数(计分卡第 9 项)、两融余额(第 10 项)、大宗交易折溢价(第 11 项)"三项从 ⚠️ 行移除,并在 ✅ 段末尾追加:
+
+```markdown
+- ✅(B1 已接入,2026-09)`holder_count`/`margin_balance`/`block_deals` 三个 fundamental_context 块:
+  股东户数 `stock_zh_a_gdhs`(近 8 期序列+集中/分散趋势,`ENABLE_HOLDER_COUNT_CONTEXT`)、
+  两融余额 `stock_margin_detail_sse/szse`(近 2 个交易日,市场级日期缓存,`ENABLE_MARGIN_BALANCE_CONTEXT`)、
+  大宗折溢价 `stock_dzjy_mrmx`(近 5 个交易日聚合+五态信号,`ENABLE_BLOCK_DEALS_CONTEXT`)。
+  三块默认关闭;预算独立(`IDENTITY_STAGE/FETCH_TIMEOUT_SECONDS`)。
+```
+
+⚠️ 段保留:龙虎榜明细与席位、股权质押、减持/增持公告结构化、财务三表关键字段(措辞微调,删去已迁移三项)。
+
+- [ ] **Step 6.4: CHANGELOG**
+
+`docs/CHANGELOG.md` `[Unreleased]` 节尾追加:
+
+```markdown
+- [新功能] 身份痕迹数据层: 股东户数/两融余额/大宗交易注入 fundamental_context(holder_count/margin_balance/block_deals 三块,默认关闭,capital_forensics 计分卡第 9/10/11 项激活)
+```
+
+- [ ] **Step 6.5: 验证**
+
+```bash
+/opt/homebrew/bin/python3.11 -c "import yaml; d=yaml.safe_load(open('strategies/capital_forensics.yaml')); ins=d['instructions']; assert '股东户数**(±2' in ins and 'ENABLE_HOLDER_COUNT_CONTEXT' in ins and '龙虎榜席位明细' in ins; print('yaml OK')"
+/opt/homebrew/bin/python3.11 -m pytest tests/test_identity_config.py -q
+grep -c "identity" docs/CHANGELOG.md   # ≥1
+```
+
+---
+
+### Task 7: 终检与真机端到端
+
+**Files:** 只读验证,无修改(若真机发现 akshare 参数名与候选不符,仅允许修 `fetch_margin_df`/`fetch_block_deals_df` 的 kwargs 并补注释,属预期内的调整循环)。
+
+- [ ] **Step 7.1: 语法与静态检查**
+
+```bash
+/opt/homebrew/bin/python3.11 -m py_compile src/config.py src/core/config_registry.py data_provider/fundamental_adapter.py data_provider/base.py
+/opt/homebrew/bin/python3.11 -m flake8 --select=E9,F63,F7,F82 src/config.py src/core/config_registry.py data_provider/fundamental_adapter.py data_provider/base.py
+```
+
+Expected: 无输出(通过)。
+
+- [ ] **Step 7.2: 离线全量**
+
+```bash
+/opt/homebrew/bin/python3.11 -m pytest -m "not network" -q
+./scripts/ci_gate.sh deterministic
+```
+
+Expected: 全绿(deterministic 阶段 = test.sh code + test.sh yfinance)。
+
+- [ ] **Step 7.3: 真机接口形态探测(网络)**
+
+先取最近一个工作日日期(今天为 2026-09-23 周三,用 20260922):
+
+```bash
+/opt/homebrew/bin/python3.11 -c "
+import akshare as ak
+df = ak.stock_zh_a_gdhs(symbol='600519'); print('gdhs:', df.columns.tolist()[:6])
+df2 = ak.stock_margin_detail_sse(date='20260922'); print('margin_sse:', df2.columns.tolist()[:6])
+df3 = ak.stock_margin_detail_szse(date='20260922'); print('margin_szse:', df3.columns.tolist()[:6])
+df4 = ak.stock_dzjy_mrmx(trade_date='2026-09-22'); print('dzjy_dash:', df4.columns.tolist()[:8])
+"
+```
+
+若 `stock_dzjy_mrmx` 的 `trade_date='2026-09-22'` 抛 TypeError/参数错误,改试 `trade_date='20260922'`;若列名与 `_find_col` 关键词均不匹配(如折溢率列实际叫别的),仅允许:①调 `fetch_*` 的 kwargs 候选;②在对应 `extract_*` 的关键词列表里补实际列名——两处都要同步到对应单测 fixture 并重跑 Task 7.2。
+
+- [ ] **Step 7.4: 真机端到端**
+
+```bash
+ENABLE_FUNDAMENTAL_PIPELINE=true ENABLE_HOLDER_COUNT_CONTEXT=true ENABLE_MARGIN_BALANCE_CONTEXT=true ENABLE_BLOCK_DEALS_CONTEXT=true \
+/opt/homebrew/bin/python3.11 -c "
+from data_provider.base import DataFetcherManager
+import json
+m = DataFetcherManager()
+ctx = m.get_fundamental_context('600519')
+for k in ('holder_count', 'margin_balance', 'block_deals'):
+    block = ctx.get(k, {})
+    print(k, '| status:', block.get('status'), '| data:', json.dumps(block.get('data', {}), ensure_ascii=False)[:300])
+print('coverage:', json.dumps(ctx.get('coverage', {}), ensure_ascii=False))
+"
+```
+
+验收:三块 status 为 ok/partial(非 not_supported/failed 视接口当日数据而定;两融/大宗若当日数据未生成允许 partial);同命令跑第二遍确认市场级缓存生效(耗时明显下降)。任一块 failed 时查日志定位是否接口形态问题,回到 Step 7.3 调整循环。
+
+- [ ] **Step 7.5: 交付说明**
+
+按仓库规则输出:改了什么/为什么(spec 路径)/验证情况(py_compile、flake8、离线全量、真机三块)/未验证项(未做 LLM `/ask` 实跑——prompt 渲染随 fundamental_context 既有通道,风险低;WebUI 配置页展示未截图验证)/风险点(akshare 接口列名漂移由 `_find_col` 关键词兜底;两融/大宗市场级缓存内存占用受 `FUNDAMENTAL_CACHE_MAX_ENTRIES` 容量约束)/回滚方式(还原 5 个代码文件 + 3 个文档/YAML,删除 2 个测试文件)。
+
+---
+
+## Self-Review 记录(计划编写时已完成)
+
+1. **Spec 覆盖**:三块定义→Task 2/3/4;市场级缓存与免 TTL→Task 3.4;配置六项→Task 1;接线与门控→Task 5;消费端三资产→Task 6;测试三档→Task 2~5(单测)+7.2(离线)+7.3/7.4(真机);错误处理→各块 fail-open+7.3 调整循环。无缺口。
+2. **占位符**:无 TBD/TODO;所有代码步骤含完整代码。
+3. **类型/命名一致**:`_find_col`/`get_holder_count_series`/`fetch_margin_df`/`extract_margin_row`/`fetch_block_deals_df`/`extract_block_deal_rows`/`_get_identity_market_frame`/`get_holder_count_context`/`get_margin_balance_context`/`get_block_deals_context`/`signal_note` 各任务引用一致;块名 `holder_count`/`margin_balance`/`block_deals` 与 spec、YAML、registry 描述一致。
+4. **已知测试注意点**:Task 3.1 测试代码中 `unittest.mock.Mock` 需按文件既有导入统一为 `Mock`(Step 3.1 已注);dzjy 探测序为日期降序,`narrowing` 的 early/late 集合取法(days[-3:]/days[:2])与 spec 修订版一致。
+5. **实施期修订(2026-09-23,Task 2 质量审查)**:①候选接口修正——`stock_zh_a_gdhs` 的 symbol 实为季度日期非股票代码,adapter 实际实现只用 `stock_zh_a_gdhs_detail_em(symbol=code)` 单候选(spec 已同步);②Step 2.1/2.3 的 fixture 列名与 NaT 防护按实际实现为准(测试 fixture 已对齐 detail_em 真实列名:股东户数统计截止日/股东户数-本次/股东户数-增减比例/户均持股数量/户均持股市值/代码),后续执行者勿按本计划 Task 2 的旧 fixture 回填;③Task 2 质量审查发现 `tests/test_fundamental_context.py::test_sector_rankings_use_ordered_fallback` 存在与本分支无关的既有失败(Task 7.2 离线全量时需在 main 基线核对,勿误归因)。
+6. **实施期修订(2026-09-23,Task 3 质量审查)**:Task 3/4 代码块的 `chain`/`errors` 在原定稿中永远为空(超时/HTTP 错/当日无数据三种失败不可区分)。修正模式:`_fetch` 闭包经 dict 捕获 `last_err` 与累计 `cost_ms`,循环后 failed 分支 `errors=[last_err or 泛化文案]`,成功路径 `chain.append({"provider": "identity:<block>", "result": ..., "duration_ms": ...})`。Task 4 实现直接采用此模式并回补 Task 3 的 margin 块;另:①`test_non_trading_fallback_partial` 的 side_effect 显式补 `[None]*5`;②补 budget_seconds=0 → failed 与 szse(0/3 前缀)路由两用例;③Task 7 全部验证必须用 `.venv/bin/python`(3.11)——系统 python3(3.9)会因 `api/v1/schemas/system_config.py:31` 的 PEP 604 语法误报失败。
+7. **实施期修订(2026-09-23,Task 4 质量审查·真机预检)**:Task 4 Step 4.3 定稿的 dzjy 调用签名全错——`stock_dzjy_mrmx` 真实签名为 `(symbol, start_date, end_date)`(紧凑日期),无 `trade_date` 参数;且必须显式 `symbol="A股"`(默认"基金"返回列结构不同的静默错误数据)。正确形态:`[("stock_dzjy_mrmx", {"symbol": "A股", "start_date": date_str, "end_date": date_str})]` 单候选,manager 侧的 dash 拼接删除。**折溢率为小数形态**,`extract_block_deal_rows` 统一 `×100` 归一为百分数;测试 fixture 的 rates 同步改小数([-0.01]/[-0.095])。fetch 层的 `_call_df_candidates` errors 不得静默丢弃(记入 stats.last_err 或 logger)。后续执行者勿按本计划 Task 4 的旧 fetch 代码块回填。
+8. **实施期修订(2026-09-23,Task 5 质量审查)**:①prune 的 TTL 豁免前缀从 `identity:mkt:` 扩大为整个 `identity:`——否则个股 holder 缓存条目被 120s 的 fundamental TTL 淘汰,`IDENTITY_CACHE_TTL_SECONDS=21600` 名存实亡(`identity:stock:` 条目由读侧自身年龄检查约束,过期条目仅在容量淘汰时清理);②`src/agent/tools/data_tools.py` 的 `_compact_fundamental_context` 必须补三个新块——否则 agent 工具路径(`get_stock_info`,bot /ask 与 skill 流程)丢弃身份块,B1 核心目的落空;③补 wiring 测试:三开关全开用例与 ETF 用例。
+9. **实施期修订(2026-09-23,Task 7 真机实测)**:预算默认值上调——`IDENTITY_STAGE_TIMEOUT_SECONDS` 8→**30**、`IDENTITY_FETCH_TIMEOUT_SECONDS` 3→**10**(config.py 两处、registry 两条、.env.example、test_identity_config 期望值已同步;spec §5 已修订)。依据:margin SSE 全市场表单次实测 7.6~8.8s,冷启动三块全程 ~22s,原默认值下两融块必超时。本计划正文中所有 8/3 默认值表述以本条为准。

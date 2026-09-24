@@ -714,6 +714,17 @@ class Config:
     # 基本面缓存最大条目数（避免长时间运行内存增长）
     fundamental_cache_max_entries: int = 256
 
+    # === B1 身份痕迹块(股东户数/两融/大宗,默认关闭) ===
+    # 依赖 ENABLE_FUNDAMENTAL_PIPELINE=true;开启后作为 fundamental_context 的
+    # holder_count/margin_balance/block_deals 三块注入(capital_forensics 计分卡 9/10/11 项)
+    enable_holder_count_context: bool = False
+    enable_margin_balance_context: bool = False
+    enable_block_deals_context: bool = False
+    # 身份痕迹块独立预算(与 fundamental 五件套分离,不挤占 valuation/growth 等现有块)
+    identity_stage_timeout_seconds: float = 30.0
+    identity_fetch_timeout_seconds: float = 10.0
+    identity_cache_ttl_seconds: int = 21600
+
     # === Portfolio PR2: import/risk/fx settings ===
     portfolio_risk_concentration_alert_pct: float = 35.0
     portfolio_risk_drawdown_alert_pct: float = 15.0
@@ -1410,6 +1421,27 @@ class Config:
             realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 600, field_name='REALTIME_CACHE_TTL', minimum=0),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
+            enable_holder_count_context=os.getenv('ENABLE_HOLDER_COUNT_CONTEXT', 'false').lower() == 'true',
+            enable_margin_balance_context=os.getenv('ENABLE_MARGIN_BALANCE_CONTEXT', 'false').lower() == 'true',
+            enable_block_deals_context=os.getenv('ENABLE_BLOCK_DEALS_CONTEXT', 'false').lower() == 'true',
+            identity_stage_timeout_seconds=parse_env_float(
+                os.getenv('IDENTITY_STAGE_TIMEOUT_SECONDS'),
+                30.0,
+                field_name='IDENTITY_STAGE_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            identity_fetch_timeout_seconds=parse_env_float(
+                os.getenv('IDENTITY_FETCH_TIMEOUT_SECONDS'),
+                10.0,
+                field_name='IDENTITY_FETCH_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            identity_cache_ttl_seconds=parse_env_int(
+                os.getenv('IDENTITY_CACHE_TTL_SECONDS'),
+                21600,
+                field_name='IDENTITY_CACHE_TTL_SECONDS',
+                minimum=0,
+            ),
             fundamental_stage_timeout_seconds=parse_env_float(
                 os.getenv('FUNDAMENTAL_STAGE_TIMEOUT_SECONDS'),
                 1.5,

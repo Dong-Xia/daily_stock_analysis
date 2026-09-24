@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.agent.tools.data_tools import _handle_get_stock_info
+from src.agent.tools.data_tools import _compact_fundamental_context, _handle_get_stock_info
 
 
 class _DummyManager:
@@ -85,6 +85,43 @@ class TestGetStockInfoContract(unittest.TestCase):
             result["fundamental_context"]["boards"]["data"],
             result["sector_rankings"],
         )
+
+
+class TestCompactFundamentalContext(unittest.TestCase):
+    def test_identity_blocks_not_dropped(self) -> None:
+        context = {
+            "market": "cn",
+            "status": "ok",
+            "coverage": {
+                "holder_count": "ok",
+                "margin_balance": "ok",
+                "block_deals": "ok",
+            },
+            "holder_count": {
+                "status": "ok",
+                "data": {"trend": "concentrating"},
+                "source_chain": ["holder_count:x"],
+            },
+            "margin_balance": {
+                "status": "ok",
+                "data": {"latest": {"rzye_yi": 21.0}},
+                "source_chain": ["margin_balance:y"],
+            },
+            "block_deals": {
+                "status": "ok",
+                "data": {"signal_note": "narrowing"},
+                "source_chain": ["block_deals:z"],
+            },
+        }
+        compact = _compact_fundamental_context(context)
+
+        # Contract: identity blocks survive compaction with status+data kept.
+        self.assertEqual(compact["holder_count"]["status"], "ok")
+        self.assertEqual(compact["holder_count"]["data"]["trend"], "concentrating")
+        self.assertEqual(compact["margin_balance"]["data"]["latest"]["rzye_yi"], 21.0)
+        self.assertEqual(compact["block_deals"]["data"]["signal_note"], "narrowing")
+        # Slim shape: non-essential keys (e.g. source_chain) are dropped.
+        self.assertNotIn("source_chain", compact["holder_count"])
 
 
 if __name__ == "__main__":

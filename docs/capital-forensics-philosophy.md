@@ -617,13 +617,16 @@ A 股市场上，绝大多数"看盘"的无效源于证据层级意识淡薄—�
 
 本地筹码引擎（详见 `docs/chip_health.md`，通达信式三角分布+换手率衰减算法）提供底部筹码流失检测能力，计分卡第 8 项（筹码峰变化）可用。`ENABLE_CHIP_DISTRIBUTION` 环境变量控制在线筹码快照能力，为单股分析上下文提供补充。
 
+- ✅(B1 已接入,2026-09)`holder_count`/`margin_balance`/`block_deals` 三个 fundamental_context 块:
+  股东户数 `stock_zh_a_gdhs_detail_em`(近 8 期序列+集中/分散趋势,`ENABLE_HOLDER_COUNT_CONTEXT`)、
+  两融余额 `stock_margin_detail_sse/szse`(近 2 个交易日,市场级日期缓存,`ENABLE_MARGIN_BALANCE_CONTEXT`)、
+  大宗折溢价 `stock_dzjy_mrmx`(近 5 个交易日聚合+五态信号:深折价/收窄/溢价/正常/无,`ENABLE_BLOCK_DEALS_CONTEXT`)。
+  三块默认关闭;预算独立(`IDENTITY_STAGE/FETCH_TIMEOUT_SECONDS`);agent 工具路径(get_stock_info)同步携带。
+
 ### ⚠️ 理论可得待接入
 
 以下数据在 akshare 等开源数据源中理论可得，但尚未对接到本仓库的数据管道中（具体接口名以接入时 akshare 文档为准）：
 
-- 股东户数（计分卡第 9 项，权重 ±2，高优先级）
-- 两融余额（计分卡第 10 项）
-- 大宗交易折溢价（计分卡第 11 项）
 - 龙虎榜明细与席位数据（第 5 章全部内容的数据基础）
 - 股权质押数据（第 6 章）
 - 减持/增持公告结构化（第 6 章）

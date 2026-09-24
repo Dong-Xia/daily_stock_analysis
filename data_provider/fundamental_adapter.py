@@ -104,6 +104,22 @@ def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
     return None
 
 
+def _find_col(
+    df: pd.DataFrame,
+    keys: List[str],
+    exclude: tuple = (),
+) -> Optional[str]:
+    """按候选关键词找列:先全等匹配,再子串匹配(可排除含排除词的列)。akshare 列名跨版本漂移,统一走此入口。"""
+    for col in df.columns:
+        if str(col) in keys:
+            return col
+    for col in df.columns:
+        col_str = str(col)
+        if any(k in col_str for k in keys) and not any(e in col_str for e in exclude):
+            return col
+    return None
+
+
 def _parse_dividend_plan_to_per_share(plan_text: str) -> Optional[float]:
     """Parse per-share cash dividend from Chinese plan text."""
     text = _safe_str(plan_text)
@@ -530,3 +546,142 @@ class AkshareFundamentalAdapter:
         result["status"] = "ok"
         result["source_chain"].append(f"dragon_tiger:{source}")
         return result
+
+    def get_holder_count_series(self, stock_code: str) -> Dict[str, Any]:
+        """股东户数序列(B1 holder_count 块数据源,计分卡第 9 项)。"""
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "latest": {},
+            "series": [],
+            "trend": "flat",
+            "source_chain": [],
+            "errors": [],
+        }
+        target = _normalize_code(stock_code)
+        df, source, errors = self._call_df_candidates([
+            ("stock_zh_a_gdhs_detail_em", {"symbol": target}),
+        ])
+        result["errors"].extend(errors)
+        if df is None:
+            return result
+
+        code_col = _find_col(df, ["代码"])
+        if code_col is not None:
+            try:
+                df = df[df[code_col].astype(str).map(_normalize_code) == target]
+            except Exception:
+                pass
+        if df is None or df.empty:
+            result["status"] = "partial"
+            result["source_chain"].append(f"holder_count:{source}")
+            return result
+
+        date_col = _find_col(df, ["日期", "截止日"])
+        num_col = _find_col(df, ["股东户数"], exclude=("增减", "比例", "幅", "户均", "日期", "截止"))
+        if date_col is None or num_col is None:
+            result["status"] = "partial"
+            result["source_chain"].append(f"holder_count:{source}")
+            return result
+        ratio_col = _find_col(df, ["增减比例", "增减幅", "较上期"])
+        avg_hold_col = _find_col(df, ["户均持股数", "户均持股"], exclude=("市值", "金额"))
+        avg_amt_col = _find_col(df, ["户均持股市值", "户均市值"])
+
+        rows: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            dt = _safe_datetime(row[date_col])
+            if dt is None:
+                continue
+            rows.append({
+                "end_date": dt.strftime("%Y%m%d"),
+                "holder_num": int(_safe_float(row[num_col]) or 0),
+                "holder_num_change_pct": _safe_float(row[ratio_col]) if ratio_col else None,
+                "avg_hold_num": _safe_float(row[avg_hold_col]) if avg_hold_col else None,
+                "avg_hold_amount": _safe_float(row[avg_amt_col]) if avg_amt_col else None,
+            })
+        rows.sort(key=lambda r: r["end_date"])
+        series = rows[-8:]
+        if not series:
+            result["status"] = "partial"
+            return result
+
+        trend = "flat"
+        ratios = [r["holder_num_change_pct"] for r in series[-2:]]
+        valid = [x for x in ratios if x is not None]
+        if len(valid) == 2:
+            if valid[0] < 0 and valid[1] < 0:
+                trend = "concentrating"
+            elif valid[0] > 0 and valid[1] > 0:
+                trend = "dispersing"
+
+        result["latest"] = series[-1]
+        result["series"] = series
+        result["trend"] = trend
+        result["status"] = "ok"
+        result["source_chain"].append(f"holder_count:{source}")
+        return result
+
+    def fetch_margin_df(self, market: str, date_str: str) -> Optional[pd.DataFrame]:
+        """两融全市场日表(market: sse|szse;date_str: YYYYMMDD)。"""
+        if market == "sse":
+            candidates = [("stock_margin_detail_sse", {"date": date_str})]
+        else:
+            candidates = [("stock_margin_detail_szse", {"date": date_str})]
+        df, _source, _errors = self._call_df_candidates(candidates)
+        if _errors:
+            logger.debug("identity fetch %s errors: %s", candidates[0][0], _errors)
+        return df
+
+    def extract_margin_row(self, df: pd.DataFrame, stock_code: str) -> Optional[Dict[str, Any]]:
+        """从两融全市场表过滤本股并提取融资余额(单位:亿元)。纯函数,无网络。"""
+        code_col = _find_col(df, ["代码"])
+        if code_col is None:
+            return None
+        target = _normalize_code(stock_code)
+        try:
+            matched = df[df[code_col].astype(str).map(_normalize_code) == target]
+        except Exception:
+            return None
+        if matched.empty:
+            return None
+        rzye_col = _find_col(df, ["融资余额"])
+        if rzye_col is None:
+            return None
+        rzye = _safe_float(matched.iloc[0][rzye_col])
+        if rzye is None:
+            return None
+        return {"rzye_yi": round(rzye / 1e8, 3)}
+
+    def fetch_block_deals_df(self, date_str: str) -> Optional[pd.DataFrame]:
+        """大宗交易 A 股全市场日明细(date_str: YYYYMMDD;signature 经真机验证)。"""
+        df, _source, _errors = self._call_df_candidates([
+            ("stock_dzjy_mrmx", {"symbol": "A股", "start_date": date_str, "end_date": date_str}),
+        ])
+        if _errors:
+            logger.debug("identity fetch %s errors: %s", "stock_dzjy_mrmx", _errors)
+        return df
+
+    def extract_block_deal_rows(self, df: pd.DataFrame, stock_code: str) -> List[Dict[str, Any]]:
+        """从大宗日明细过滤本股的当日全部成交(折溢率%、成交额亿元、买卖营业部;源表折溢率为小数,归一为百分数)。纯函数。"""
+        code_col = _find_col(df, ["代码"])
+        if code_col is None:
+            return []
+        target = _normalize_code(stock_code)
+        try:
+            matched = df[df[code_col].astype(str).map(_normalize_code) == target]
+        except Exception:
+            return []
+        premium_col = _find_col(df, ["折溢率", "折溢价", "溢价率"])
+        amount_col = _find_col(df, ["成交额"])
+        buyer_col = _find_col(df, ["买方营业部", "买方"])
+        seller_col = _find_col(df, ["卖方营业部", "卖方"])
+        rows: List[Dict[str, Any]] = []
+        for _, row in matched.iterrows():
+            amount = _safe_float(row[amount_col]) if amount_col else None
+            premium = _safe_float(row[premium_col]) if premium_col else None
+            rows.append({
+                "premium_rate": round(premium * 100, 3) if premium is not None else None,
+                "amount_yi": round(amount / 1e8, 4) if amount is not None else None,
+                "buyer_branch": str(row[buyer_col]) if buyer_col else None,
+                "seller_branch": str(row[seller_col]) if seller_col else None,
+            })
+        return rows

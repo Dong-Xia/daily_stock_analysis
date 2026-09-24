@@ -52,7 +52,11 @@ def _get_db():
 
 
 def _compact_fundamental_context(fundamental_context: dict) -> dict:
-    """Reduce token footprint for tool responses while keeping key semantics."""
+    """Reduce token footprint for tool responses while keeping key semantics.
+
+    Identity-trace blocks (holder_count / margin_balance / block_deals) are kept
+    with the same slim status+data shape as the other fundamental blocks.
+    """
     if not isinstance(fundamental_context, dict):
         return {}
     blocks = (
@@ -63,6 +67,9 @@ def _compact_fundamental_context(fundamental_context: dict) -> dict:
         "capital_flow",
         "dragon_tiger",
         "boards",
+        "holder_count",
+        "margin_balance",
+        "block_deals",
     )
     compact = {
         "market": fundamental_context.get("market"),

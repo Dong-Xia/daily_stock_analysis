@@ -96,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 大盘状态分类器（MarketRegimeClassifier）同源 bug：`_fetch_index_data` 对上证综指（000001）经 `get_daily_data` 取到的是平安银行个股数据，导致市场阶段按单只银行股误判；现将上证指数路由至 `get_index_daily_data`（实测取回 ≈3900 点），深证成指/创业板指（399xxx，不与个股冲突）保持原路径
 - [新功能] capital_forensics(资金筹码取证)策略技能: 量化主导判别+主力周期定位+收派计分卡+监管痕迹一票否决
 - [文档] 资金筹码取证方法论规约: docs/capital-forensics-philosophy.md
+- [新功能] 身份痕迹数据层: 股东户数/两融余额/大宗交易注入 fundamental_context(holder_count/margin_balance/block_deals 三块,默认关闭,capital_forensics 计分卡第 9/10/11 项激活)
 
 ## [3.12.0] - 2026-04-01
 

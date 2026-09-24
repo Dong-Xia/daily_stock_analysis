@@ -654,7 +654,8 @@ class DataFetcherManager:
                 expired_keys = [
                     key
                     for key, value in cache_items
-                    if now_ts - float(value.get("ts", 0)) > ttl_seconds
+                    if not key.startswith("identity:")  # identity: 前缀条目免 TTL:市场级不可变;个股级由读侧自身 TTL 约束,过期条目仅容量淘汰时清理
+                    and now_ts - float(value.get("ts", 0)) > ttl_seconds
                 ]
                 for key in expired_keys:
                     self._fundamental_cache.pop(key, None)
@@ -667,6 +668,32 @@ class DataFetcherManager:
                 )
                 for key, _ in sorted_items[:overflow]:
                     self._fundamental_cache.pop(key, None)
+
+    def _get_identity_market_frame(
+        self,
+        block: str,
+        market: str,
+        date_str: str,
+        fetch_fn: Callable[[], Optional[pd.DataFrame]],
+        deadline: float,
+    ) -> Optional[pd.DataFrame]:
+        """市场级日期缓存读取(identity:mkt: 前缀条目不可变,命中免 TTL,仅容量淘汰)。"""
+        key = f"identity:mkt:{block}:{market}:{date_str}"
+        with self._fundamental_cache_lock:
+            item = self._fundamental_cache.get(key)
+            if item and item.get("frame") is not None:
+                return item["frame"]
+        if time.time() >= deadline:
+            return None
+        try:
+            df = fetch_fn()
+        except Exception:
+            return None
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[key] = {"ts": time.time(), "frame": df}
+            return df
+        return None
 
     @staticmethod
     def _try_scalar_isna(value: Any, context: str) -> Optional[bool]:
@@ -1993,6 +2020,9 @@ class DataFetcherManager:
             "capital_flow",
             "dragon_tiger",
             "boards",
+            "holder_count",
+            "margin_balance",
+            "block_deals",
         ):
             payload = context.get(block, {})
             if isinstance(payload, dict) and DataFetcherManager._has_meaningful_payload(payload.get("data")):
@@ -2140,6 +2170,9 @@ class DataFetcherManager:
             "capital_flow": {},
             "dragon_tiger": {},
             "boards": {},
+            "holder_count": {},
+            "margin_balance": {},
+            "block_deals": {},
             "coverage": {},
             "source_chain": [],
             "errors": [],
@@ -2321,6 +2354,24 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
                 ["etf not fully supported"],
             )
+            result_ctx["holder_count"] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["etf not fully supported"],
+            )
+            result_ctx["margin_balance"] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["etf not fully supported"],
+            )
+            result_ctx["block_deals"] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["etf not fully supported"],
+            )
             result_ctx["status"] = "partial"
         else:
             capital_flow_budget = min(fetch_timeout, remaining_seconds)
@@ -2344,6 +2395,26 @@ class DataFetcherManager:
                 budget_seconds=min(fetch_timeout, remaining_seconds),
             )
 
+            # B1 身份痕迹块(默认关闭;独立预算,不占用 fundamental stage 预算)
+            identity_remaining = float(getattr(config, "identity_stage_timeout_seconds", 8.0))
+            if getattr(config, "enable_holder_count_context", False) and identity_remaining > 0:
+                _t0 = time.time()
+                result_ctx["holder_count"] = self.get_holder_count_context(
+                    stock_code, budget_seconds=identity_remaining
+                )
+                identity_remaining = max(0.0, identity_remaining - (time.time() - _t0))
+            if getattr(config, "enable_margin_balance_context", False) and identity_remaining > 0:
+                _t0 = time.time()
+                result_ctx["margin_balance"] = self.get_margin_balance_context(
+                    stock_code, budget_seconds=identity_remaining
+                )
+                identity_remaining = max(0.0, identity_remaining - (time.time() - _t0))
+            if getattr(config, "enable_block_deals_context", False) and identity_remaining > 0:
+                _t0 = time.time()
+                result_ctx["block_deals"] = self.get_block_deals_context(
+                    stock_code, budget_seconds=identity_remaining
+                )
+
         block_statuses = {
             "valuation": result_ctx["valuation"].get("status", "not_supported"),
             "growth": result_ctx["growth"].get("status", "not_supported"),
@@ -2352,6 +2423,9 @@ class DataFetcherManager:
             "capital_flow": result_ctx["capital_flow"].get("status", "not_supported"),
             "dragon_tiger": result_ctx["dragon_tiger"].get("status", "not_supported"),
             "boards": result_ctx["boards"].get("status", "not_supported"),
+            "holder_count": result_ctx["holder_count"].get("status", "not_supported"),
+            "margin_balance": result_ctx["margin_balance"].get("status", "not_supported"),
+            "block_deals": result_ctx["block_deals"].get("status", "not_supported"),
         }
         result_ctx["coverage"] = block_statuses
         for block in (
@@ -2362,6 +2436,9 @@ class DataFetcherManager:
             "capital_flow",
             "dragon_tiger",
             "boards",
+            "holder_count",
+            "margin_balance",
+            "block_deals",
         ):
             result_ctx["errors"].extend(result_ctx[block].get("errors", []))
             result_ctx["source_chain"].extend(result_ctx[block].get("source_chain", []))
@@ -2501,6 +2578,252 @@ class DataFetcherManager:
             ),
             list(payload.get("errors", [])) + ([err] if err else []),
         )
+
+    def get_holder_count_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """股东户数块(B1,计分卡第 9 项;季度序列与集中/分散趋势,fail-open)。"""
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+        # 个股级 TTL 缓存(identity_cache_ttl_seconds 的消费点;季度数据,TTL 默认 6h)
+        cache_ttl = int(getattr(config, "identity_cache_ttl_seconds", 21600))
+        cache_key = f"identity:stock:holder:{stock_code}"
+        if cache_ttl > 0:
+            with self._fundamental_cache_lock:
+                item = self._fundamental_cache.get(cache_key)
+                if item and time.time() - float(item.get("ts", 0)) <= cache_ttl:
+                    return dict(item.get("block", {}))
+        stage_budget = float(
+            budget_seconds if budget_seconds is not None else getattr(config, "identity_stage_timeout_seconds", 8.0)
+        )
+        if stage_budget <= 0:
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
+                ["identity stage timeout"],
+            )
+        fetch_timeout = min(float(getattr(config, "identity_fetch_timeout_seconds", 3.0)), stage_budget)
+        payload, err, cost_ms = self._run_with_retry(
+            lambda: self._fundamental_adapter.get_holder_count_series(stock_code),
+            fetch_timeout,
+            "holder_count",
+        )
+        if not isinstance(payload, dict):
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
+                [err or "holder_count failed"],
+            )
+        status = payload.get("status")
+        data = {
+            "latest": payload.get("latest", {}),
+            "series": payload.get("series", []),
+            "trend": payload.get("trend", "flat"),
+            "reading_note": "户数下降+股价上涨=主升健康;户数下降+横盘=吸筹期;户数上升+股价上涨=派发危险(散户接盘);户数上升+下跌=回避。",
+            "source": "ak.stock_zh_a_gdhs_detail_em",
+        }
+        block = self._build_fundamental_block(
+            status if isinstance(status, str) else "partial",
+            data,
+            self._normalize_source_chain(
+                payload.get("source_chain", []),
+                "holder_count",
+                str(status or "partial"),
+                cost_ms,
+            ),
+            list(payload.get("errors", [])) + ([err] if err else []),
+        )
+        if cache_ttl > 0 and block.get("status") == "ok":
+            with self._fundamental_cache_lock:
+                # 注意:block 与返回值共享嵌套对象,消费方必须只读(与 pipeline 既有约定一致)
+                self._fundamental_cache[cache_key] = {"ts": time.time(), "block": block}
+        return block
+
+    def get_margin_balance_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """两融余额块(B1,计分卡第 10 项;市场级日期缓存,fail-open)。"""
+        from datetime import timedelta
+
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+        prefix = stock_code[:1]
+        if prefix == "6":
+            market = "sse"
+        elif prefix in ("0", "3"):
+            market = "szse"
+        else:
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["margin detail only supports sse/szse"],
+            )
+        stage_budget = float(
+            budget_seconds if budget_seconds is not None else getattr(config, "identity_stage_timeout_seconds", 8.0)
+        )
+        deadline = time.time() + max(0.0, stage_budget)
+        fetch_timeout = float(getattr(config, "identity_fetch_timeout_seconds", 3.0))
+        stats: Dict[str, Any] = {"last_err": None, "cost_ms": 0}
+        rows: List[Dict[str, Any]] = []
+        day = datetime.now().date()
+        for _ in range(7):
+            if len(rows) >= 2 or time.time() > deadline:
+                break
+            date_str = day.strftime("%Y%m%d")
+            day = day - timedelta(days=1)
+
+            def _fetch(d: str = date_str) -> Optional[pd.DataFrame]:
+                result, err, ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.fetch_margin_df(market, d),
+                    min(fetch_timeout, max(0.0, deadline - time.time())),
+                    "margin_balance",
+                )
+                stats["cost_ms"] += int(ms)
+                if err:
+                    stats["last_err"] = err
+                if isinstance(result, pd.DataFrame) and not result.empty:
+                    return result
+                return None
+
+            frame = self._get_identity_market_frame("margin", market, date_str, _fetch, deadline)
+            if frame is None:
+                continue
+            row = self._fundamental_adapter.extract_margin_row(frame, stock_code)
+            if row:
+                rows.append({"date": date_str, **row})
+        chain = [{
+            "provider": "identity:margin",
+            "result": "ok" if rows else "failed",
+            "duration_ms": stats["cost_ms"],
+        }]
+        if not rows:
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                chain,
+                [stats["last_err"] or "no margin data in recent 7d"],
+            )
+        latest = rows[0]
+        prev = rows[1] if len(rows) > 1 else None
+        change_pct = None
+        if prev and prev.get("rzye_yi"):
+            change_pct = round((latest["rzye_yi"] - prev["rzye_yi"]) / prev["rzye_yi"] * 100, 3)
+        payload = {
+            "latest": {"date": latest["date"], "rzye_yi": latest["rzye_yi"], "change_pct_1d": change_pct},
+            "reading_note": "低位融资余额持续增加=有信心的杠杆资金;高位激增=散户杠杆接盘(派发确认);破位后放量=强平负反馈,不计价格。",
+            "source": "ak.stock_margin_detail_sse/szse",
+        }
+        return self._build_fundamental_block("ok" if len(rows) >= 2 else "partial", payload, chain, [])
+
+    def get_block_deals_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """大宗交易块(B1,计分卡第 11 项;最近 5 个交易日聚合,市场级日期缓存,fail-open)。"""
+        from datetime import timedelta
+
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+        stage_budget = float(
+            budget_seconds if budget_seconds is not None else getattr(config, "identity_stage_timeout_seconds", 8.0)
+        )
+        deadline = time.time() + max(0.0, stage_budget)
+        fetch_timeout = float(getattr(config, "identity_fetch_timeout_seconds", 3.0))
+        stats: Dict[str, Any] = {"last_err": None, "cost_ms": 0}
+        days: List[str] = []  # 探测序=日期降序
+        deals: List[Dict[str, Any]] = []
+        day = datetime.now().date()
+        for _ in range(10):
+            if len(days) >= 5 or time.time() > deadline:
+                break
+            date_str = day.strftime("%Y%m%d")
+            day = day - timedelta(days=1)
+
+            def _fetch(d: str = date_str) -> Optional[pd.DataFrame]:
+                result, err, ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.fetch_block_deals_df(d),
+                    min(fetch_timeout, max(0.0, deadline - time.time())),
+                    "block_deals",
+                )
+                stats["cost_ms"] += int(ms)
+                if err:
+                    stats["last_err"] = err
+                if isinstance(result, pd.DataFrame) and not result.empty:
+                    return result
+                return None
+
+            frame = self._get_identity_market_frame("dzjy", "all", date_str, _fetch, deadline)
+            if frame is None:
+                continue
+            days.append(date_str)
+            for r in self._fundamental_adapter.extract_block_deal_rows(frame, stock_code):
+                deals.append({"date": date_str, **r})
+        chain = [{
+            "provider": "identity:block_deals",
+            "result": "ok" if days else "failed",
+            "duration_ms": stats["cost_ms"],
+        }]
+        if not days:
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                chain,
+                [stats["last_err"] or "no block-deal frames in recent 10d"],
+            )
+        rates = [d["premium_rate"] for d in deals if d.get("premium_rate") is not None]
+        amounts = [d["amount_yi"] for d in deals if d.get("amount_yi") is not None]
+        early_dates = set(days[-3:])   # 窗口内最早的 3 个交易日
+        late_dates = set(days[:2])     # 最近的 2 个交易日
+        early_rates = [d["premium_rate"] for d in deals if d["date"] in early_dates and d.get("premium_rate") is not None]
+        late_rates = [d["premium_rate"] for d in deals if d["date"] in late_dates and d.get("premium_rate") is not None]
+        avg_rate = round(sum(rates) / len(rates), 3) if rates else None
+        if not deals:
+            signal = "none"
+        elif early_rates and min(early_rates) <= -8 and late_rates and all(r > -5 for r in late_rates):
+            signal = "narrowing"
+        elif rates and min(rates) <= -8:
+            signal = "deep_discount"
+        elif rates and sum(rates) / len(rates) > 0:
+            signal = "premium"
+        else:
+            signal = "normal"
+        payload = {
+            "recent_5d": {
+                "deal_count": len(deals),
+                "total_amount_yi": round(sum(amounts), 3) if amounts else None,
+                "avg_premium_rate": avg_rate,
+                "min_premium_rate": round(min(rates), 3) if rates else None,
+                "max_premium_rate": round(max(rates), 3) if rates else None,
+            },
+            "latest": {k: deals[0][k] for k in ("date", "premium_rate", "amount_yi", "buyer_branch", "seller_branch")} if deals else None,
+            "signal_note": signal,
+            "reading_note": "持续深折价(≤-8%)=卖方急于离场不惜成本,接盘方到账即卖有次日抛压;折价收窄=抛压减轻;溢价成交=无法表演的最强承接信号。",
+            "source": "ak.stock_dzjy_mrmx",
+        }
+        return self._build_fundamental_block("ok", payload, chain, [])
 
     def get_board_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
         """板块榜单块（fail-open）。"""

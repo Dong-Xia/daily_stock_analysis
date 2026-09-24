@@ -1,0 +1,171 @@
+# B1 身份痕迹数据层(股东户数/两融/大宗)设计文档
+
+- 日期:2026-09-23
+- 类型:feat(数据接入,方案 A:复用 fundamental_context 块模式)
+- 状态:设计已获用户认可,待写实现计划
+- 上游:B 阶段蓝本 `docs/capital-forensics-philosophy.md` 第 10 章;A 阶段 spec `2026-09-21-capital-forensics-design.md`
+- 环境事实:akshare 1.18.64 已安装,`stock_zh_a_gdhs` / `stock_zh_a_gdhs_detail_em` / `stock_margin_detail_sse` / `stock_margin_detail_szse` / `stock_dzjy_mrmx` 全部存在;`ENABLE_FUNDAMENTAL_PIPELINE` 默认 `true`(config.py:705)
+
+## 1. 背景与目标
+
+A 阶段交付的 `capital_forensics` 策略技能存在结构性短板:计分卡 12 项中最硬的第 9 项(股东户数 ±2)、第 10 项(两融 ±1)、第 11 项(大宗 ±1)没有数据通道,只能靠新闻检索。B1 为这三项接通真实数据,以 `fundamental_context` 新块形式注入 LLM 分析 prompt,激活多源交叉验证。
+
+**范围**:仅数据接入与 prompt 注入。计分卡程序化引擎/回测/批量预热/前端展示留 B2+(见第 9 节)。
+
+## 2. 架构总览(方案 A)
+
+照抄现有 `dragon_tiger` 块模板(`get_dragon_tiger_context`,base.py:2455):
+
+```
+AkshareFundamentalAdapter 新增 3 个方法(_call_df_candidates 候选探测,fail-open)
+  → DataFetcherManager.get_fundamental_context 新增 3 个块(holder_count/margin_balance/block_deals)
+    → 随 fundamental_context 自动渲染进 LLM prompt(analyzer.py:1597 现有注入点;
+      预期零渲染代码——若现有渲染对新增块的呈现不可读,仅在 analyzer 渲染处补一个块级格式化分支,属实现期小改动)
+      → capital_forensics.yaml 计分卡第 9/10/11 项激活
+```
+
+不新增平行路径;不写 SQLite(akshare 返回历史序列,按需模式无需本地积累)。
+
+## 3. 三个块的定义
+
+### 3.1 holder_count 块(计分卡第 9 项,权重 ±2)
+
+- 接口:`stock_zh_a_gdhs_detail_em(symbol=<code>)`——单次调用返回个股完整季度历史(**2026-09-23 实施期修订**:原定主接口 `stock_zh_a_gdhs` 的 symbol 参数实为季度日期而非股票代码,误用会产生 TypeError 与伪 errors 污染,已弃用)。列名经关键词匹配(`_find_col`,应对 akshare 列名漂移,实际列形如 股东户数统计截止日/股东户数-本次/股东户数-增减比例/户均持股数量/户均持股市值/代码)。
+- 输出 schema(块内 dict):
+
+```python
+{
+  "latest": {"end_date": "20260630", "holder_num": 48000, "holder_num_change_pct": -15.2,
+              "avg_hold_num": float, "avg_hold_amount": float},
+  "series": [  # 最近 4~8 期,按期升序
+    {"end_date": str, "holder_num": int, "holder_num_change_pct": float}, ...
+  ],
+  "trend": "concentrating" | "dispersing" | "flat",   # 连续2期降=concentrating;连续2期升=dispersing;其余=flat
+  "reading_note": "户数下降+股价上涨=主升健康;户数下降+股价横盘=吸筹期;户数上升+股价上涨=派发危险(散户接盘);户数上升+股价下跌=无人接盘阴跌,回避。",
+  "source": "ak.stock_zh_a_gdhs", "error": None,      # 失败时 error 填字符串,数据字段为空
+}
+```
+
+### 3.2 margin_balance 块(计分卡第 10 项,权重 ±1)
+
+- 接口为**按日期索引的全市场表**:`stock_margin_detail_sse(date=YYYYMMDD)` / `stock_margin_detail_szse(date=YYYYMMDD)`,按代码路由(6 开头→SSE,0/3 开头→SZSE),过滤本股行。
+- 取数窗口:最近 **2 个交易日**;非交易日回退(从当日向前找最近交易日的实现:逐日回退探测,最多回退 7 个自然日,失败即 error)。
+- **市场级日期缓存**:cache key=`(block, market, date)`,与 fundamental 现有 market-level 缓存同机制同一批条目池;TTL 复用 `fundamental_cache_ttl_seconds`。同一天分析任何股票共享一次请求。
+- 输出 schema:
+
+```python
+{
+  "latest": {"date": str, "rzye": float, "change_pct_1d": float},   # 融资余额 + 日环比
+  "reading_note": "低位融资余额持续增加=有信心的杠杆资金;高位激增=散户杠杆接盘(派发确认信号);破位后激增=强平负反馈,不计价格。",
+  "source": "ak.stock_margin_detail_sse|szse", "error": None,
+}
+```
+
+### 3.3 block_deals 块(计分卡第 11 项,权重 ±1)
+
+- 接口:`stock_dzjy_mrmx(symbol="A股", start_date=YYYYMMDD, end_date=YYYYMMDD)` 全市场日明细,过滤本股行;取最近 **5 个交易日**。(**2026-09-23 实施期修订**,原稿 `trade_date=YYYY-MM-DD` 为错误签名:真实签名是 `(symbol, start_date, end_date)` 且日期为紧凑格式;不传 symbol 默认返回**基金**大宗表(列结构不同,静默错误数据),必须显式 `symbol="A股"`。**折溢率为小数形态**(如 -0.1164,=(成交价-收盘)/收盘),adapter 提取时统一 ×100 归一为百分数,使 -8/-5 阈值与 reading_note 语义成立。)
+- 市场级日期缓存同 3.2(TTL 同池;当日数据晚间生成,12 小时内不重复拉同一天——实现上直接复用 fundamental_cache_ttl,若其值小于 6h 也不影响正确性,只是可能重拉)。
+- 输出 schema:
+
+```python
+{
+  "recent_5d": {"deal_count": int, "total_amount_yi": float, "avg_premium_rate": float,
+                 "min_premium_rate": float, "max_premium_rate": float},
+  "latest": {"date": str, "premium_rate": float, "amount_yi": float,
+              "buyer_branch": str, "seller_branch": str},
+  "signal_note": "deep_discount" | "narrowing" | "premium" | "normal" | "none",
+    # 判定顺序(先命中先输出;none 优先判空;narrowing 必须先于 deep_discount,
+    # 否则"早期深折价+近期收窄"会被 any<=-8% 抢先命中,narrowing 永不可达):
+    #   none: 窗口内无大宗成交
+    #   narrowing: 窗口内最早的 3 个交易日存在 premium_rate <= -8% 且最近 2 个交易日均 > -5%
+    #   deep_discount: 窗口内任一日 premium_rate <= -8%
+    #   premium: avg_premium_rate > 0
+    #   normal: 窗口内有成交但以上均不满足
+    # (schema 字段为语义命名,实现时从 akshare 原始列名映射,映射关系在 fixture 测试中固化)
+  "reading_note": "持续深折价(≤-8%)=卖方急于离场不惜成本,接盘方到账即卖有次日抛压;折价收窄=抛压减轻;溢价成交=无法表演的最强承接信号。",
+  "source": "ak.stock_dzjy_mrmx", "error": None,
+}
+```
+
+- 判读阈值出处:`docs/capital-forensics-philosophy.md` 第 5 章(深折价 8~10%+、溢价=最强承接)。
+
+### 3.4 公共语义
+
+- 三块均为 fail-open:候选接口全失败 → 块内 `error` 填充、数据字段为空,其他块与分析主流程零影响(与 `dragon_tiger` 块同语义)。
+- 数据为空(次新股东数缺失、窗口内无大宗等)是**正常路径**,`error=None` + 空数据 + `signal_note="none"`,不算失败。
+- 块仅适用于 A 股;港/美股由 `get_fundamental_context` 现有 `market not supported` 短路天然覆盖,无需新代码。
+
+## 4. 缓存设计(关键决策)
+
+两融/大宗接口是按**日期**的全市场表(单次调用返回全 A),因此缓存 key 必须是市场级 `(block, market, date)` 而非个股级:
+
+| 场景 | 请求数 |
+|------|--------|
+| 首只股票分析 | 两融 2 次 + 大宗 5 次 + 户数 1 次(个股接口) |
+| 同日再分析任意股票 | 两融 0~1 次 + 大宗 0 次 + 户数 1 次(市场表全命中) |
+
+实现:复用 `DataFetcherManager` 现有 fundamental market-level 缓存池(现有 `_fundamental_cache` 及锁/TTL 清理逻辑),新块的市场级条目与个股级 context 条目同池共存,受同一 `fundamental_cache_max_entries` 容量约束。
+
+## 5. 配置与注册(最小配置面)
+
+- **新增 3 个布尔开关 + 3 个预算项**(开关默认 `false`,不配可运行、配置后增强):
+  - `ENABLE_HOLDER_COUNT_CONTEXT` / `ENABLE_MARGIN_BALANCE_CONTEXT` / `ENABLE_BLOCK_DEALS_CONTEXT`
+  - `IDENTITY_STAGE_TIMEOUT_SECONDS`(默认 30)/ `IDENTITY_FETCH_TIMEOUT_SECONDS`(默认 10)/ `IDENTITY_CACHE_TTL_SECONDS`(默认 21600)(**2026-09-23 真机修订**:初版 8/3 系估算值,实测冷启动 margin SSE 全市场表单次 7.6~8.8s、户数 ~3s、大宗 0.7s/日,冷启动全程 ~22s,故上调为 30/10)
+- **预算独立于 fundamental 五件套**(2026-09-23 修订:原"复用五件套"在其默认值下不可用——stage 1.5s/fetch 0.8s 不足以完成两融/大宗全市场表首拉,120s TTL 使市场级缓存摊薄失效;独立预算亦避免挤占 valuation/growth 等现有块)。重试次数仍复用 `fundamental_retry_max`,缓存容量仍复用 `fundamental_cache_max_entries`(市场级条目同池)。
+- **市场级日期条目不受 TTL 淘汰**(按日数据不可变,命中永久有效,仅受容量淘汰);个股级上下文条目沿用 identity TTL。
+- 门控:双层——`ENABLE_FUNDAMENTAL_PIPELINE`(现有总开关,默认 true)+ 各块独立开关(默认 false)。
+- 配套登记:`src/config.py`(字段+读取)、`src/core/config_registry.py`(仿 `ENABLE_CHIP_DISTRIBUTION` 条目,UI 可见)、`.env.example`(注释掉的默认写法 + 说明块开关依赖 fundamental pipeline 开启)。
+
+## 6. 消费端配套
+
+1. `strategies/capital_forensics.yaml`:
+   - 第三步计分卡补第 9/10/11 项判定规则(读 fundamental_context 的三块:户数降 ±2、融资余额激增于高位 -1、大宗深折价 -1 / 溢价 +1 等,阈值与文档第 3 章 12 项卡一致);
+   - "数据不可得清单"删去股东户数/融资余额/大宗交易(保留分时结构、盘口大单、历史事件日回溯、龙虎榜席位明细);
+   - 注明数据由 fundamental_context 的 `holder_count`/`margin_balance`/`block_deals` 三块自动注入,需开启对应开关。
+2. `docs/capital-forensics-philosophy.md` 第 10 章:三项 ⚠️→✅,标注接口名与取数窗口(户数 4~8 期 / 两融 2 日 / 大宗 5 日)。
+3. `docs/CHANGELOG.md` `[Unreleased]` 追加 `- [新功能] 身份痕迹数据层: 股东户数/两融余额/大宗交易注入 fundamental_context(capital_forensics 计分卡 9/10/11 项激活)`。
+4. 文档为中文,不新增 EN 版(与 A 阶段决策一致)。
+
+## 7. 错误处理与降级链
+
+```
+akshare 调用失败 → tenacity retry 3 次指数退避(adapter 现有)
+  → 候选切换(_call_df_candidates)
+    → 全候选失败 → 块 {"error": "...", 空数据}
+      → 其他块照常;get_fundamental_context 整体照常;分析主流程零感知
+限流(RateLimitError) → adapter 现有 rate limit 拦截,块 error
+非交易日 → 逐日回退探测(两融/大宗),最多回退 7 自然日,失败即 error
+```
+
+## 8. 测试与验收(用户已定档:单测+离线+真机端到端)
+
+- **单元测试(mock akshare 模块)**,新增 `tests/` 下文件:
+  - 字段映射正确(三个接口各一组固定 DataFrame fixture);
+  - 市场级缓存:同日第二次调用不发网络请求(mock 计数);
+  - SSE/SZSE 代码路由(600519→sse,000001→szse,300750→szse);
+  - 非交易日回退与 7 日上限;
+  - `trend` 计算(连续降/升/混合三例)与 `signal_note` 五态;
+  - 块级 fail-open(一接口抛错不影响其他块);
+  - 开关关闭时块不出现且不发起请求。
+- **离线**:`pytest -m "not network"` 全绿;`./scripts/ci_gate.sh deterministic`。
+- **真机端到端**(网络,手动/标记 network):
+  - `600519` 调 `get_fundamental_context`:三块有数(户数序列/两融余额/大宗聚合);
+  - `/ask 600519 筹码取证` 输出引用户数/两融/大宗证据;
+  - 注入错误日期参数验证降级不崩。
+
+## 9. 范围外(B2+ 预留)
+
+- 计分卡程序化引擎与历史回测(届时评估方案 C 的 SQLite 落库);
+- 全市场批量预热 CLI(两融/大宗长序列、日线级数据积累);
+- 龙虎榜席位档案化深化(现有 `dragon_tiger` 块之上);
+- 情绪指数合成;前端/UI 展示(块随 prompt 注入,Web 报告展示跟随现有 fundamental 渲染行为,不做专门开发);
+- EN 版文档。
+
+## 10. 关键决策记录
+
+1. 方案 A(fundamental_context 块模式),否决 B(独立通道=平行实现)与 C(SQLite 落库,YAGNI)。
+2. 市场级 `(block, market, date)` 缓存——由两融/大宗接口的日期索引形态决定。
+3. 取数窗口最小化:户数 4~8 期、两融 2 日、大宗 5 日(首拉成本与判读够用的平衡;更长序列留 B2 批量预热)。
+4. 配置面:3 个块开关 + 独立预算三件套(stage 8s/fetch 3s/TTL 21600s)。原"仅复用 fundamental 五件套"方案在其默认值下不可用,2026-09-23 经用户确认修订;重试与容量仍复用现有项。
+5. 空数据与失败分离:空=正常路径(`signal_note="none"`),失败=`error` 字段。
+6. 交付含 YAML/文档/CHANGELOG 同步,不加 EN 版。

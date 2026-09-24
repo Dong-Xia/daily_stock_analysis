@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 信号链多时段流水线 API
-POST /signal-pipeline/run      — 启动流水线
-GET  /signal-pipeline/status   — 查询运行进度
-GET  /signal-pipeline/results  — 查询筛选结果
+POST /signal-pipeline/run               — 启动流水线
+GET  /signal-pipeline/status            — 查询运行进度
+GET  /signal-pipeline/results           — 查询筛选结果
+GET  /signal-pipeline/fundamental-filter — 信号链结果与基本面通过名单取交集
+GET  /signal-pipeline/download          — 下载每日分析 Excel
 """
 
 import json
@@ -51,6 +53,22 @@ class SignalResults(BaseModel):
     timeframe_label: str
     count: int
     rows: list
+
+
+def _load_signal_df(date: str, timeframe: str) -> pd.DataFrame:
+    """读取信号链 CSV(fundflow 变体优先), 不存在时 404。"""
+    key = date.replace('-', '')
+    suffix = '' if timeframe == 'daily' else f'_{timeframe}'
+    fund_file = os.path.join(STOCK_DATA_DIR, f'signal_chain_{key}{suffix}_fundflow.csv')
+    chain_file = os.path.join(STOCK_DATA_DIR, f'signal_chain_{key}{suffix}.csv')
+
+    src = fund_file if os.path.exists(fund_file) else chain_file
+    if not os.path.exists(src):
+        raise HTTPException(status_code=404, detail=f'未找到 {date} {TIMEFRAME_LABELS[timeframe]} 信号链')
+
+    df = pd.read_csv(src, dtype=str).fillna('')
+    # 重命名列以便前端统一处理
+    return df.rename(columns={'当日主力占比%': '当日主力占比'})
 
 
 def _run_pipeline(trade_date: str):
@@ -124,21 +142,7 @@ def get_results(
     if timeframe not in TIMEFRAMES:
         raise HTTPException(status_code=400, detail=f'无效时段: {timeframe}')
 
-    key = date.replace('-', '')
-    suffix = '' if timeframe == 'daily' else f'_{timeframe}'
-    fund_file = os.path.join(STOCK_DATA_DIR, f'signal_chain_{key}{suffix}_fundflow.csv')
-    chain_file = os.path.join(STOCK_DATA_DIR, f'signal_chain_{key}{suffix}.csv')
-
-    src = fund_file if os.path.exists(fund_file) else chain_file
-    if not os.path.exists(src):
-        raise HTTPException(status_code=404, detail=f'未找到 {date} {TIMEFRAME_LABELS[timeframe]} 信号链')
-
-    df = pd.read_csv(src, dtype=str).fillna('')
-    # 重命名列以便前端统一处理
-    col_map = {
-        '当日主力占比%': '当日主力占比',
-    }
-    df = df.rename(columns=col_map)
+    df = _load_signal_df(date, timeframe)
 
     return SignalResults(
         date=date,
@@ -146,6 +150,60 @@ def get_results(
         timeframe_label=TIMEFRAME_LABELS[timeframe],
         count=len(df),
         rows=df.to_dict(orient='records'),
+    )
+
+
+class FundamentalFilterResults(BaseModel):
+    date: str
+    timeframe: str
+    timeframe_label: str
+    quarter: str
+    total: int
+    matched: int
+    rows: list
+
+
+@router.get('/fundamental-filter', summary='信号链结果与基本面通过名单取交集')
+def get_fundamental_filter(
+    date: str = Query(..., description='交易日 YYYY-MM-DD'),
+    timeframe: str = Query('daily', description='时段: daily/5min/15min/30min'),
+):
+    if timeframe not in TIMEFRAMES:
+        raise HTTPException(status_code=400, detail=f'无效时段: {timeframe}')
+
+    from src.services.fundamental_screener import FundamentalScreener
+
+    df = _load_signal_df(date, timeframe)
+    quarter = FundamentalScreener._resolve_latest_quarter()
+    try:
+        pass_map = FundamentalScreener().get_pass_map(quarter)
+    except Exception as e:
+        logger.error('基本面通过名单获取失败: %s', e)
+        raise HTTPException(status_code=502, detail=f'财报数据获取失败: {e}')
+
+    rows = df.to_dict(orient='records')
+    matched_rows = []
+    for row in rows:
+        code = str(row.get('股票代码', '')).strip()
+        fund = pass_map.get(code)
+        if fund is None:
+            continue
+        matched_rows.append({
+            **row,
+            '营收同比%': f"{fund['revenue_yoy']:.1f}",
+            '利润同比%': f"{fund['profit_yoy']:.1f}",
+            '净利润(亿)': f"{fund['net_profit'] / 1e8:.2f}",
+            '基本面评分': f"{fund['composite_score']:.1f}",
+        })
+
+    return FundamentalFilterResults(
+        date=date,
+        timeframe=timeframe,
+        timeframe_label=TIMEFRAME_LABELS[timeframe],
+        quarter=quarter,
+        total=len(rows),
+        matched=len(matched_rows),
+        rows=matched_rows,
     )
 
 

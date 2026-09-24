@@ -2,7 +2,7 @@
 # Infers the true intent of capital from volume-price behavior and chip structure:
 # quant-dominance gate, main-force cycle phase, accumulation-vs-distribution scorecard,
 # plus a regulatory-trace cross-check with one-vote veto power.
-# Full methodology: docs/capital-forensics-philosophy.md
+# Full methodology: docs/资金筹码取证方法论.md
 
 name: capital_forensics
 display_name: 资金筹码取证
@@ -20,7 +20,7 @@ aliases: [筹码取证, 收派判别, 主力周期]
 instructions: |
   **资金筹码取证（Capital & Chip Forensics）**
 
-  完整方法论规约见 `docs/capital-forensics-philosophy.md`，本技能是其在现有数据下可执行的子集。
+  完整方法论规约见 `docs/资金筹码取证方法论.md`，本技能是其在现有数据下可执行的子集。
 
   ## 定位声明
 

@@ -95,8 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] `DataFetcherManager.get_index_daily_data()`：A 股指数日线历史数据专用入口（东财 `index_zh_a_hist` 优先、新浪 `stock_zh_index_daily` 兜底），规避指数代码与个股代码空间重叠的歧义（如 `000001` 同时是上证指数与平安银行）；超跌反弹战法与大盘状态分类器共用，消除平行实现
 - [修复] 大盘状态分类器（MarketRegimeClassifier）同源 bug：`_fetch_index_data` 对上证综指（000001）经 `get_daily_data` 取到的是平安银行个股数据，导致市场阶段按单只银行股误判；现将上证指数路由至 `get_index_daily_data`（实测取回 ≈3900 点），深证成指/创业板指（399xxx，不与个股冲突）保持原路径
 - [新功能] capital_forensics(资金筹码取证)策略技能: 量化主导判别+主力周期定位+收派计分卡+监管痕迹一票否决
-- [文档] 资金筹码取证方法论规约: docs/capital-forensics-philosophy.md
+- [文档] 资金筹码取证方法论规约: docs/资金筹码取证方法论.md
 - [新功能] 身份痕迹数据层: 股东户数/两融余额/大宗交易注入 fundamental_context(holder_count/margin_balance/block_deals 三块,默认关闭,capital_forensics 计分卡第 9/10/11 项激活)
+- [文档] 资金筹码取证使用指南: docs/资金筹码取证使用指南.md
+- [修复] 热点板块链式选股（Web 选股页）恒返回"共 0 个板块"：上游每日板块名跨数据源不一致（概念/申万/行业全名混用）导致轮动分类全灭时选股器无候选可选；现回退到耐久度排序 Top N 板块继续精选，并在日志提示命名碎片化
 
 ## [3.12.0] - 2026-04-01
 

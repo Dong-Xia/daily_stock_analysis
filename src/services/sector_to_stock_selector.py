@@ -149,6 +149,25 @@ class SectorToStockSelector:
                         })
                         seen_names.add(sector.name)
 
+            # 上游每日板块名来自不同数据源（概念/申万/行业全名），跨日命名
+            # 不一致时分类门槛可能全军覆没；此时回退到耐久度排序前几名，
+            # 保证链式选股可用而非空转
+            if not candidates and rotation_result.sectors:
+                logger.warning(
+                    "[SectorToStock] 无板块满足主线/轮动分类（历史命名碎片化？），"
+                    "回退到耐久度 Top %d",
+                    self.max_sectors,
+                )
+                for sector in rotation_result.sectors[:self.max_sectors]:
+                    if sector.name and sector.name not in seen_names:
+                        candidates.append({
+                            "name": sector.name,
+                            "classification": sector.classification,
+                            "classification_cn": sector.classification_cn,
+                            "score": sector.current_score,
+                        })
+                        seen_names.add(sector.name)
+
             return candidates[:self.max_sectors]
 
         except ImportError as e:
@@ -169,8 +188,10 @@ class SectorToStockSelector:
             from src.services.stock_screener_service import StockScreenerService
             from src.schemas.stock_screener_schema import ScreenerCriteria
 
-            # 单板块预算 40s：最坏 5×(40+8)=240s，留在 hot-sector-chain 端点 300s 超时内；
-            # 旧值 170s 时最坏 5×(170+8)=890s，必然被 wait_for(300) 腰斩成 504
+            # 单板块筛选预算 40s（自成分股抓取完成后起算）：东财被封时
+            # board_scraper 抓成分股可达 50-75s/板块，最坏 5×(75+40)+4×8≈610s，
+            # 端点 wait_for 与前端超时均为 600s；首轮冷缓存慢，当日成分股与
+            # 非空筛选结果均有缓存，后续点击显著加速
             service = StockScreenerService(
                 max_candidates=10,
                 timeout_budget=40.0,

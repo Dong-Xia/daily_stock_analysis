@@ -26,6 +26,7 @@ AkshareFetcher - 主数据源 (Priority 1)
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1070,6 +1071,121 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, failure_message)
             return None
     
+    @staticmethod
+    def _build_tencent_quote(stock_code: str, fields: List[str]) -> UnifiedRealtimeQuote:
+        """腾讯行情 '~' 分隔字段 → UnifiedRealtimeQuote（单只/批量共用）。
+
+        腾讯数据字段顺序（完整）：
+        1:名称 2:代码 3:最新价 4:昨收 5:今开 6:成交量(手) 7:外盘 8:内盘
+        9-28:买卖五档 30:时间戳 31:涨跌额 32:涨跌幅(%) 33:最高 34:最低 35:收盘/成交量/成交额
+        36:成交量(手) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
+        44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
+        """
+        return UnifiedRealtimeQuote(
+            code=stock_code,
+            name=fields[1] if len(fields) > 1 else "",
+            source=RealtimeSource.TENCENT,
+            price=safe_float(fields[3]),
+            change_pct=safe_float(fields[32]),
+            change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
+            volume=safe_int(fields[6]) * 100 if fields[6] else None,  # 腾讯返回的是手，转为股
+            open_price=safe_float(fields[5]),
+            high=safe_float(fields[33]) if len(fields) > 33 else None,  # 修正：字段 33 是最高价
+            low=safe_float(fields[34]) if len(fields) > 34 else None,  # 修正：字段 34 是最低价
+            pre_close=safe_float(fields[4]),
+            turnover_rate=safe_float(fields[38]) if len(fields) > 38 else None,
+            amplitude=safe_float(fields[43]) if len(fields) > 43 else None,
+            volume_ratio=safe_float(fields[49]) if len(fields) > 49 else None,  # 量比
+            pe_ratio=safe_float(fields[39]) if len(fields) > 39 else None,  # 市盈率
+            pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,  # 市净率
+            circ_mv=safe_float(fields[44]) * 100000000 if len(fields) > 44 and fields[44] else None,  # 流通市值(亿->元)
+            total_mv=safe_float(fields[45]) * 100000000 if len(fields) > 45 and fields[45] else None,  # 总市值(亿->元)
+        )
+
+    def get_realtime_quotes_batch_tencent(
+        self, stock_codes: List[str], chunk_size: int = 60
+    ) -> Dict[str, UnifiedRealtimeQuote]:
+        """腾讯批量实时行情（qt.gtimg.cn 原生支持逗号分隔多标的）。
+
+        逐只调用受防限流随机休眠与 fetcher 级串行锁约束（实测 ~6s/只，30 只串行
+        180s 直接击穿板块精选 40s 预算）；批量把 N 只压缩为 ceil(N/chunk_size)
+        次请求，30 只约 2-4s。解析失败/未返回的代码不在结果中，由调用方逐只兜底。
+        """
+        circuit_breaker = get_realtime_circuit_breaker()
+        source_key = "akshare_tencent"
+        results: Dict[str, UnifiedRealtimeQuote] = {}
+        codes = [c for c in (stock_codes or []) if c]
+        api_start = time.time()
+
+        for i in range(0, len(codes), chunk_size):
+            chunk = codes[i:i + chunk_size]
+            symbol_map = {_to_sina_tx_symbol(code): code for code in chunk}
+            url = f"http://{TENCENT_REALTIME_ENDPOINT}={','.join(symbol_map)}"
+            try:
+                headers = {
+                    'Referer': 'http://finance.qq.com',
+                    'User-Agent': random.choice(USER_AGENTS)
+                }
+                logger.info(
+                    f"[API调用] 腾讯财经接口批量获取 {len(chunk)} 只实时行情: endpoint={TENCENT_REALTIME_ENDPOINT}"
+                )
+                self._enforce_rate_limit()
+                response = requests.get(url, headers=headers, timeout=15)
+                response.encoding = 'gbk'
+
+                if response.status_code != 200:
+                    circuit_breaker.record_failure(
+                        source_key,
+                        _build_realtime_failure_message(
+                            source_name="腾讯",
+                            endpoint=TENCENT_REALTIME_ENDPOINT,
+                            stock_code=f"batch[{len(chunk)}]",
+                            symbol="",
+                            category="http_status",
+                            detail=f"HTTP {response.status_code}",
+                            elapsed=time.time() - api_start,
+                            error_type="HTTPStatus",
+                        ),
+                    )
+                    continue
+
+                parsed = 0
+                # 每行形如 v_sz300080="51~名称~...";  无效标的载荷为空
+                for match in re.finditer(r'v_([a-z0-9]+)="([^"]*)"', response.text):
+                    symbol, payload = match.group(1), match.group(2)
+                    code = symbol_map.get(symbol)
+                    if not code or not payload:
+                        continue
+                    fields = payload.split('~')
+                    if len(fields) < 45:
+                        continue
+                    results[code] = self._build_tencent_quote(code, fields)
+                    parsed += 1
+
+                circuit_breaker.record_success(source_key)
+                logger.info(
+                    f"[实时行情-腾讯批量] 本批 {len(chunk)} 只, 解析成功 {parsed} 只, "
+                    f"elapsed={time.time() - api_start:.2f}s"
+                )
+            except Exception as e:
+                category, detail = _classify_realtime_http_error(e)
+                circuit_breaker.record_failure(
+                    source_key,
+                    _build_realtime_failure_message(
+                        source_name="腾讯",
+                        endpoint=TENCENT_REALTIME_ENDPOINT,
+                        stock_code=f"batch[{len(chunk)}]",
+                        symbol="",
+                        category=category,
+                        detail=detail,
+                        elapsed=time.time() - api_start,
+                        error_type=type(e).__name__,
+                    ),
+                )
+                continue
+
+        return results
+
     def _get_stock_realtime_quote_tencent(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取普通 A 股实时行情数据（腾讯财经数据源）
@@ -1169,34 +1285,9 @@ class AkshareFetcher(BaseFetcher):
                 return None
             
             circuit_breaker.record_success(source_key)
-            
-            # 腾讯数据字段顺序（完整）：
-            # 1:名称 2:代码 3:最新价 4:昨收 5:今开 6:成交量(手) 7:外盘 8:内盘
-            # 9-28:买卖五档 30:时间戳 31:涨跌额 32:涨跌幅(%) 33:最高 34:最低 35:收盘/成交量/成交额
-            # 36:成交量(手) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
-            # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
-            # 使用 realtime_types.py 中的统一转换函数
-            quote = UnifiedRealtimeQuote(
-                code=stock_code,
-                name=fields[1] if len(fields) > 1 else "",
-                source=RealtimeSource.TENCENT,
-                price=safe_float(fields[3]),
-                change_pct=safe_float(fields[32]),
-                change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
-                volume=safe_int(fields[6]) * 100 if fields[6] else None,  # 腾讯返回的是手，转为股
-                open_price=safe_float(fields[5]),
-                high=safe_float(fields[33]) if len(fields) > 33 else None,  # 修正：字段 33 是最高价
-                low=safe_float(fields[34]) if len(fields) > 34 else None,  # 修正：字段 34 是最低价
-                pre_close=safe_float(fields[4]),
-                turnover_rate=safe_float(fields[38]) if len(fields) > 38 else None,
-                amplitude=safe_float(fields[43]) if len(fields) > 43 else None,
-                volume_ratio=safe_float(fields[49]) if len(fields) > 49 else None,  # 量比
-                pe_ratio=safe_float(fields[39]) if len(fields) > 39 else None,  # 市盈率
-                pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,  # 市净率
-                circ_mv=safe_float(fields[44]) * 100000000 if len(fields) > 44 and fields[44] else None,  # 流通市值(亿->元)
-                total_mv=safe_float(fields[45]) * 100000000 if len(fields) > 45 and fields[45] else None,  # 总市值(亿->元)
-            )
-            
+
+            quote = self._build_tencent_quote(stock_code, fields)
+
             logger.info(
                 f"[实时行情-腾讯] {stock_code} {quote.name}: endpoint={TENCENT_REALTIME_ENDPOINT}, "
                 f"价格={quote.price}, 涨跌={quote.change_pct}%, 量比={quote.volume_ratio}, "

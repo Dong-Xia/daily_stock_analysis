@@ -108,7 +108,7 @@ export const stockPickApi = {
       const response = await apiClient.post<Record<string, unknown>>(
         '/api/v1/stocks/hot-sector-chain',
         {},
-        { timeout: 300000 },
+        { timeout: 600000 },
       );
       return toCamelCase<HotSectorChainResponse>(response.data);
     }, 1, 2000, (err) => {

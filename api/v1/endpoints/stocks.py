@@ -676,7 +676,7 @@ async def hot_sector_chain():
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(selector.execute),
-            timeout=300.0,
+            timeout=600.0,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="热点板块链式选股超时，请稍后重试")

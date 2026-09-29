@@ -1241,6 +1241,28 @@ class DataFetcherManager:
             logger.error(f"[预取] 批量预取异常: {e}")
             return 0
     
+    def get_realtime_quotes_batch(self, stock_codes):
+        """
+        批量实时行情（腾讯多标的接口，一次请求拿整批）。
+
+        用于板块精选等一次需要几十只 A 股行情的场景，绕开逐只调用时
+        防限流休眠 + fetcher 级串行锁造成的串行耗时（~6s/只）。
+        返回 {code: UnifiedRealtimeQuote}；未覆盖/失败的代码不在结果中，
+        调用方可对缺失代码走原有逐只回退链。
+        """
+        if not stock_codes:
+            return {}
+        for fetcher in self._get_fetchers_snapshot():
+            if fetcher.name == "AkshareFetcher" and hasattr(fetcher, "get_realtime_quotes_batch_tencent"):
+                try:
+                    return self._call_fetcher_method(
+                        fetcher, "get_realtime_quotes_batch_tencent", list(stock_codes)
+                    )
+                except Exception as e:
+                    logger.warning(f"[实时行情批量] AkshareFetcher 批量获取失败: {e}")
+                    return {}
+        return {}
+
     def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
         """
         获取实时行情数据（自动故障切换）

@@ -94,9 +94,6 @@ class StockScreenerService:
         sector_name = criteria.sector_name or ""
         backtest_date = criteria.backtest_date
 
-        # Calculate deadline for time-budget control (realtime mode only)
-        deadline = (time.monotonic() + self.timeout_budget) if not backtest_date else None
-
         # Cache check (realtime mode only, same-day reuse)
         if not backtest_date:
             try:
@@ -143,6 +140,11 @@ class StockScreenerService:
                 timestamp=datetime.now().isoformat(),
                 mode="backtest" if backtest_date else "realtime",
             )
+
+        # Calculate deadline for time-budget control (realtime mode only).
+        # 必须在成分股抓取之后起算：东财被封时 board_scraper 兜底可达 50-75s，
+        # 若预算把成员抓取也算进去，进入漏斗时预算已耗尽，L1/L2 全部跳过 → 恒 0 候选
+        deadline = (time.monotonic() + self.timeout_budget) if not backtest_date else None
 
         # Pre-trim: limit stocks entering expensive realtime-quote fetch (Layer 1)
         # and daily-data fetch (Layer 2). change_pct is already available from
@@ -283,10 +285,26 @@ class StockScreenerService:
             return {}
         n_workers = max_workers or self.parallel_workers
         results: Dict[str, Optional[Any]] = {}
+
+        # 批量行情优先：一次请求拿整批（腾讯多标的接口），绕开逐只串行 +
+        # 防限流休眠（~6s/只，30 只 180s 直接击穿单板块预算）
+        if deadline is None or time.monotonic() < deadline:
+            try:
+                batch_quotes = self.data_manager.get_realtime_quotes_batch(codes)
+            except Exception as e:
+                logger.warning("[选股] 批量实时行情失败，回退逐只获取: %s", e)
+                batch_quotes = {}
+            results.update(batch_quotes or {})
+
+        missing = [c for c in codes if c not in results]
+        if not missing:
+            return results
+        logger.info("[选股] 批量行情覆盖 %d/%d，剩余 %d 只走逐只获取", len(results), len(codes), len(missing))
+
         executor = ThreadPoolExecutor(max_workers=n_workers)
         try:
             future_map = {}
-            for code in codes:
+            for code in missing:
                 future_map[executor.submit(
                     self.data_manager.get_realtime_quote, code, log_final_failure=False
                 )] = code
